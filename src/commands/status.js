@@ -3,7 +3,12 @@ import path from "node:path";
 
 import { color, json, out } from "../logger.js";
 import { resolveMemoryFiles } from "../memory.js";
-import { loadSkills, resolveOverflowTarget } from "../skills.js";
+import {
+  loadProjectSkills,
+  resolveOverflowTarget,
+  resolveProjectSkillDirs,
+  skillDescriptionTokens,
+} from "../skills.js";
 import { budgetBar, budgetStatus, formatTokens } from "../tokens.js";
 import { table } from "./scan.js";
 import { DEFAULT_EFFORT } from "../config.js";
@@ -24,15 +29,23 @@ export async function cmdStatus(ctx) {
   const proposal = state.readProposal();
   const rejections = state.readRejections();
   const overflow = resolveOverflowTarget(repo.root, config.skillsDir);
-  const skills = loadSkills(repo.root, overflow.dir);
+  const skillDirs = resolveProjectSkillDirs(repo.root, overflow.dir);
+  const skills = loadProjectSkills(repo.root, overflow.dir);
+  const descriptionTokens = skillDescriptionTokens(skills);
 
-  const budgets = files.map((file) => ({
-    path: file.path,
-    ...budgetStatus(file.text, null, config.budgetTokens),
-    instructions: file.units.length,
-    pointerTo: resolved.pointers.includes(file) ? resolved.primary.path : null,
-    separate: resolved.separate.includes(file),
-  }));
+  const budgets = files.map((file) => {
+    const includesSkills = file === resolved.primary && skills.length > 0;
+    return {
+      path: file.path,
+      label: includesSkills ? `${file.path} + skill descriptions` : file.path,
+      ...budgetStatus(file.text, null, config.budgetTokens, {
+        current: includesSkills ? descriptionTokens : 0,
+      }),
+      instructions: file.units.length,
+      pointerTo: resolved.pointers.includes(file) ? resolved.primary.path : null,
+      separate: resolved.separate.includes(file),
+    };
+  });
 
   if (ctx.flags.json) {
     json({
@@ -62,17 +75,16 @@ export async function cmdStatus(ctx) {
       (b.withinBudget ? "" : color.red(` ${b.over} OVER`)) +
       (b.separate ? color.yellow(" separate - not optimized") : "");
     out(
-      `  ${b.path.padEnd(14)} ${budgetBar(b)} ${formatTokens(b.current)} / ${formatTokens(b.capTokens)} tok` +
+      `  ${b.label.padEnd(14)} ${budgetBar(b)} ${formatTokens(b.current)} / ${formatTokens(b.capTokens)} tok` +
         ` · ${b.instructions} instructions${state_}`,
     );
   }
   if (skills.length) {
     const skillTokens = skills.reduce((n, s) => n + s.bodyTokens, 0);
-    const descTokens = skills.reduce((n, s) => n + s.descriptionTokens, 0);
     out(
       color.dim(
-        `  overflow: ${skills.length} skill(s) in ${overflow.dir} · ${formatTokens(skillTokens)} tok on trigger, ` +
-          `${formatTokens(descTokens)} tok always loaded`,
+        `  overflow: ${skills.length} skill(s) in ${skillDirs.join(", ")} · ${formatTokens(skillTokens)} tok on trigger, ` +
+          `${formatTokens(descriptionTokens)} tok always loaded`,
       ),
     );
   }

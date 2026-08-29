@@ -6,7 +6,13 @@ import { renderEvidenceForPrompt } from "./fold.js";
 import { renderInstructionIndex } from "./memory.js";
 import { renderPrompt, render, loadPrompt } from "./prompts.js";
 import { buildProposal, effectiveMaxEdits, ProposalViolation, renderChangesForPrompt } from "./proposal.js";
-import { loadSkills, renderSkillIndex, resolveOverflowTarget } from "./skills.js";
+import {
+  loadProjectSkills,
+  renderSkillIndex,
+  resolveOverflowTarget,
+  resolveProjectSkillDirs,
+  skillDescriptionTokens,
+} from "./skills.js";
 import { isSuppressedByRejection } from "./state.js";
 import { emitProgress } from "./progress.js";
 import { measureWorkspace, prepareWorkspace, repoFingerprint } from "./workspace.js";
@@ -17,8 +23,8 @@ import { UserError, color, info, warn } from "./logger.js";
  * evidence into concrete edits.
  *
  * The agent never describes an edit for backpass to locate - it makes the edit, with its
- * harness's own file tools, in a staging copy of the memory file (`src/workspace.js`).
- * A run starts in one session with two kinds of turn:
+ * harness's own file tools, in a staging copy of the memory file and project skills
+ * (`src/workspace.js`). A run starts in one session with two kinds of turn:
  *
  *   edit      the synthesis prompt; the agent edits `./AGENTS.md` in the staging copy
  *   annotate  backpass measures the copy against the original (`src/diff.js`) and shows
@@ -63,33 +69,48 @@ const EMPTY_TURN_VIOLATION =
 const UNPARSEABLE_VIOLATION = "synthesis answered with text, but not with a JSON object";
 const KEPT_EDITING_VIOLATION = "synthesis kept editing the staging copy instead of annotating the measured changes";
 
-function budgetRule(memoryFile, config, maxEdits) {
-  const remaining = config.budgetTokens - memoryFile.tokens;
+/**
+ * The budget the prompts frame is the always-loaded surface: the memory file plus
+ * every skill description line, the same sum the mechanical gate measures
+ * (`buildProposal`). Framing one number and gating another would set the model up to
+ * fail a gate it was never told about.
+ */
+function budgetRule(memoryFile, config, maxEdits, descriptionTokens = 0) {
+  const remaining = config.budgetTokens - memoryFile.tokens - descriptionTokens;
+  const counted = descriptionTokens
+    ? ` The budget counts this file plus every skill description line (${descriptionTokens} tok of descriptions today); skill bodies stay free until triggered.`
+    : "";
   if (remaining <= 0) {
     return (
-      `This file is ALREADY ${Math.abs(remaining)} tokens OVER budget, so this run is a SHRINK ` +
+      `The always-loaded surface is ALREADY ${Math.abs(remaining)} tokens OVER budget, so this run is a SHRINK ` +
       `PLAN. You are NOT expected to reach ${config.budgetTokens} tokens in one run - the ` +
       `${maxEdits}-edit cap for this run makes that impossible and later runs continue the work. ` +
       `What is required is real progress: the edit set MUST be net-negative, so lead with skill ` +
-      `extractions of long, narrow, crisply-triggered sections - extraction frees the same ` +
-      `always-loaded tokens and loses nothing, and it never needs removal evidence. Deleting an ` +
+      `extractions of long, narrow, crisply-triggered sections - extraction frees the removed ` +
+      `always-loaded tokens for the price of one description line and loses nothing, and it never needs removal ` +
+      `evidence. Deleting an ` +
       `instruction outright still needs its harm-evidence floor; the budget never lowers that ` +
       `bar. Any addition must name the removal or extraction that pays for it. Make the largest ` +
-      `honest reduction you can justify from the evidence.`
+      `honest reduction you can justify from the evidence.` +
+      counted
     );
   }
   if (remaining < config.budgetTokens * 0.15) {
     return (
       `Only ${remaining} tokens of headroom remain. Treat this as zero-sum: every addition must ` +
-      `name its offsetting removal or skill extraction. The post-edit file must stay at or below ` +
-      `${config.budgetTokens} tokens.`
+      `name its offsetting removal or skill extraction. The post-edit always-loaded surface must stay at or below ` +
+      `${config.budgetTokens} tokens.` +
+      counted
     );
   }
-  return `The post-edit file must stay at or below ${config.budgetTokens} tokens (${remaining} tokens of headroom today).`;
+  return (
+    `The post-edit always-loaded surface must stay at or below ${config.budgetTokens} tokens ` +
+    `(${remaining} tokens of headroom today).${counted}`
+  );
 }
 
-function budgetState(memoryFile, config) {
-  const ratio = memoryFile.tokens / config.budgetTokens;
+function budgetState(memoryFile, config, descriptionTokens = 0) {
+  const ratio = (memoryFile.tokens + descriptionTokens) / config.budgetTokens;
   if (ratio > 1) return "OVER BUDGET";
   if (ratio > 0.85) return "near budget";
   return "within budget";
@@ -133,19 +154,21 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts }) {
   const rejections = state.readRejections();
   const overflow = resolveOverflowTarget(repo.root, config.skillsDir);
   for (const w of overflow.warnings) warn(w);
-  const skillFiles = loadSkills(repo.root, overflow.dir);
-  const maxEdits = effectiveMaxEdits(memoryFile, config);
+  const skillDirs = resolveProjectSkillDirs(repo.root, overflow.dir);
+  const skillFiles = loadProjectSkills(repo.root, overflow.dir);
+  const descriptionTokens = skillDescriptionTokens(skillFiles);
+  const maxEdits = effectiveMaxEdits(memoryFile, config, descriptionTokens);
 
   const common = {
     MEMORY_PATH: memoryFile.path,
-    BUDGET_RULE: budgetRule(memoryFile, config, maxEdits),
+    BUDGET_RULE: budgetRule(memoryFile, config, maxEdits, descriptionTokens),
     MAX_EDITS: String(maxEdits),
     MIN_GAP_EVIDENCE: String(config.minGapEvidence),
   };
 
   const context = {
     memoryFile,
-    config: { ...config, skillsDir: overflow.dir },
+    config: { ...config, skillsDir: overflow.dir, skillDirs },
     repo,
     summary,
     harnessCounts,
@@ -157,7 +180,18 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts }) {
   const promptDir = path.join(state.root, "prompts");
   fs.mkdirSync(promptDir, { recursive: true });
 
-  return { state, rejections, overflow, skillFiles, maxEdits, common, context, promptDir };
+  return {
+    state,
+    rejections,
+    overflow,
+    skillDirs,
+    skillFiles,
+    descriptionTokens,
+    maxEdits,
+    common,
+    context,
+    promptDir,
+  };
 }
 
 /**
@@ -166,14 +200,14 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts }) {
  * fresh session used after an empty reply would otherwise be asked to quote evidence it
  * has never been shown.
  */
-function prefaceFor({ memoryFile, summary, config, repo, workspaceRoot }) {
+function prefaceFor({ memoryFile, summary, config, repo, workspaceRoot, descriptionTokens = 0 }) {
   return render(loadPrompt("annotate-preface"), {
     MEMORY_PATH: memoryFile.path,
     REPO_NAME: repo.name,
     REPO_ROOT: repo.root,
     WORKSPACE_ROOT: workspaceRoot,
-    CURRENT_TOKENS: String(memoryFile.tokens),
-    BUDGET_STATE: budgetState(memoryFile, config),
+    CURRENT_TOKENS: String(memoryFile.tokens + descriptionTokens),
+    BUDGET_STATE: budgetState(memoryFile, config, descriptionTokens),
     TRANSCRIPT_COUNT: String(summary.analyzedSessions),
     EVIDENCE: renderEvidenceForPrompt(summary),
   });
@@ -356,7 +390,18 @@ async function annotateLoop({
 export async function synthesizeProposal({ memoryFile, summary, config, repo, transcripts, runNote = "" }) {
   config.state.clearProposal();
   const harnessCounts = harnessCountsOf(transcripts);
-  const { state, rejections, overflow, skillFiles, maxEdits, common, context, promptDir } = synthesisSetup({
+  const {
+    state,
+    rejections,
+    overflow,
+    skillDirs,
+    skillFiles,
+    descriptionTokens,
+    maxEdits,
+    common,
+    context,
+    promptDir,
+  } = synthesisSetup({
     memoryFile,
     summary,
     config,
@@ -374,9 +419,9 @@ export async function synthesizeProposal({ memoryFile, summary, config, repo, tr
       Object.entries(harnessCounts)
         .map(([h, n]) => `${h} ${n}`)
         .join(" · ") || "none",
-    CURRENT_TOKENS: String(memoryFile.tokens),
+    CURRENT_TOKENS: String(memoryFile.tokens + descriptionTokens),
     BUDGET_TOKENS: String(config.budgetTokens),
-    BUDGET_STATE: budgetState(memoryFile, config),
+    BUDGET_STATE: budgetState(memoryFile, config, descriptionTokens),
     INSTRUCTION_INDEX: renderInstructionIndex(memoryFile),
     SKILLS_DIR: overflow.dir,
     SKILL_INDEX: renderSkillIndex(skillFiles),
@@ -441,7 +486,7 @@ export async function synthesizeProposal({ memoryFile, summary, config, repo, tr
     holder.ranWith = current.agent;
     chosen = current;
     if (current !== pick) notes.push(`synthesis fell through to ${current.agent} (${current.model})`);
-    workspace = prepareWorkspace({ state, repo, memoryFile, skillsDir: overflow.dir });
+    workspace = prepareWorkspace({ state, repo, memoryFile, skillsDir: overflow.dir, skillDirs });
     progress("edit", { attempt: 1 });
     holder.session = await openSession({
       agent: current.agent,
@@ -493,7 +538,8 @@ export async function synthesizeProposal({ memoryFile, summary, config, repo, tr
       noteOnce,
       overflow,
       progress,
-      renderPreface: () => prefaceFor({ memoryFile, summary, config, repo, workspaceRoot: workspace.root }),
+      renderPreface: () =>
+        prefaceFor({ memoryFile, summary, config, repo, workspaceRoot: workspace.root, descriptionTokens }),
     });
   } finally {
     await holder.session.close();

@@ -11,46 +11,49 @@ import { printUsage } from "./usage.js";
 import { discoverForRun } from "./scan.js";
 
 /**
- * Fold on-disk evidence for the memory file. Gap corroboration is counted through the
+ * Fold on-disk evidence for the memory surface. Gap corroboration is counted through the
  * persisted ledger so sessions accumulate across runs: record this run's observations,
- * prune what the current file now covers or what aged out (after recording, because the
- * evidence files that fed an expired sighting are still on disk and would re-add it),
+ * prune what the current surface now covers or what aged out (after recording, because
+ * the evidence files that fed an expired sighting are still on disk and would re-add it),
  * then cluster from the ledger.
  *
  * Evidence is also filtered to `memoryHash`: a transcript's evidence file is rewritten
- * every time it is re-analyzed against a changed memory file, but a transcript that fell
- * out of this run's sample (window, cap, or discovery drift) leaves its last evidence file
- * on disk under whatever hash it was last judged against. That leftover file is real and
- * reusable the moment its transcript is re-analyzed - or immediately, if the memory file's
- * bytes return to that hash - but folding it into *this* proposal would score it against
+ * every time it is re-analyzed against a changed memory file or skill description, but a
+ * transcript that fell out of this run's sample (window, cap, or discovery drift) leaves
+ * its last evidence file on disk under whatever hash it was last judged against. That
+ * leftover file is real and reusable the moment its transcript is re-analyzed - or
+ * immediately, if the memory surface returns to that hash - but folding it into *this*
+ * proposal would score it against
  * an instruction index it was never judged against (aliases are positional) and inflate
  * `analyzedSessions` with a session this run never touched. Nothing is migrated, rewritten,
  * or deleted here - only excluded from this run's fold.
  */
-export async function foldForRun(ctx, memoryFile, memoryHash) {
+export async function foldForRun(ctx, memoryFile, memoryHash, skills = []) {
   const { state, minGapEvidence, gapLedgerMaxAge } = ctx.config;
   const evidence = state.listEvidence();
   const relevant = evidence.filter((e) => e.memoryPath === memoryFile.path && e.memoryHash === memoryHash);
 
   const ledger = state.readGapLedger();
-  recordGapObservations(ledger, relevant);
+  recordGapObservations(ledger, relevant, { skills });
   // Consolidate after recording, so the pass sees this run's sightings too: two
   // sessions coining the same brand-new gap in one parallel fan-out can only line up
   // here. One bounded judged call; a failure degrades to lexical identity and the run
   // continues. Prune afterwards so a merged-then-covered gap retires as one entry.
+  // Skills join the coverage check: a gap resolved by an extraction or a skill fix
+  // retires instead of haunting the open-gap index until it expires.
   const consolidation = await consolidateGapLedger({
     ledger,
     memoryPath: memoryFile.path,
     config: ctx.config,
     repo: ctx.repo,
   });
-  pruneGapLedger(ledger, { memoryFile, memoryPath: memoryFile.path, maxAge: gapLedgerMaxAge });
+  pruneGapLedger(ledger, { memoryFile, memoryPath: memoryFile.path, skills, maxAge: gapLedgerMaxAge });
   state.writeGapLedger(ledger);
 
   const summary = foldEvidence(relevant, {
     minGapEvidence,
     memoryFile,
-    gapObservations: ledgerGapObservations(ledger, memoryFile.path),
+    gapObservations: ledgerGapObservations(ledger, memoryFile.path, skills),
   });
   summary.consolidation = consolidation;
   return summary;
@@ -68,11 +71,11 @@ export async function runProposal(ctx, precomputed = null) {
   // folding, and agent resolution can all fail before synthesis starts; none of those
   // failures may leave an older proposal available to apply as if it came from this run.
   config.state.clearProposal();
-  const { file, hash } = precomputed || primaryMemoryFile(repo, config);
+  const { file, hash, skills } = precomputed || primaryMemoryFile(repo, config);
   const transcripts = precomputed?.transcripts || (await discoverForRun(ctx)).transcripts;
 
   const foldStarted = Date.now();
-  const summary = await foldForRun(ctx, file, hash);
+  const summary = await foldForRun(ctx, file, hash, skills ?? []);
   config.state.writeSummary(summary);
   emitProgress("fold:done", {
     instructions: summary.instructions.length,

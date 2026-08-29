@@ -2,39 +2,58 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { applyEdit, projectWithDecisions } from "../proposal.js";
+import { applyEdit } from "../proposal.js";
 import { memoryTextHash } from "../memory.js";
-import { budgetGateKind, budgetStatus, formatTokens } from "../tokens.js";
+import { budgetGateKind, budgetStatus, estimateTokens, formatTokens } from "../tokens.js";
 import { recordRejection } from "../state.js";
 import {
   CANONICAL_SKILLS_DIR,
   CLAUDE_SKILLS_LINK,
   editSkills,
   ensureSkillsLayout,
+  loadProjectSkills,
+  parseFrontmatter,
   removeOwnedSkillPaths,
+  resolveOverflowTarget,
+  skillDescriptionTokens,
   writeSkill,
 } from "../skills.js";
 
-function acceptedSubsetBudgetFailure({ proposal, accepted, repo, capTokens, memoryText }) {
-  if (!accepted.length) return null;
+/**
+ * The always-loaded label a budget number carries: the surface when skill descriptions
+ * are part of the count, the bare file when there are none - a number shown to a person
+ * must describe the thing it measures.
+ */
+function surfaceLabel(memoryPath, descriptionTokens) {
+  return descriptionTokens ? `the always-loaded surface (${memoryPath} + skill descriptions)` : memoryPath;
+}
 
+function descriptionTokensIn(text) {
+  return estimateTokens(parseFrontmatter(text).description || "");
+}
+
+function acceptedSubsetBudgetFailure({
+  proposal,
+  capTokens,
+  memoryText,
+  projectedMemoryText,
+  descriptionTokensNow,
+  descriptionTokensProjected,
+}) {
   const relative = proposal.memoryFile.path;
-  const absolute = path.join(repo.root, relative);
-  if (memoryText === null && !fs.existsSync(absolute)) return null;
+  if (memoryText === null) return null;
 
-  const before = memoryText ?? fs.readFileSync(absolute, "utf8");
-  const { budget } = projectWithDecisions(
-    before,
-    accepted,
-    accepted.map((edit) => edit.id),
-    capTokens,
-  );
+  const budget = budgetStatus(memoryText, projectedMemoryText, capTokens, {
+    current: descriptionTokensNow,
+    projected: descriptionTokensProjected,
+  });
+  const label = surfaceLabel(relative, Math.max(descriptionTokensNow, descriptionTokensProjected));
   const gate = budgetGateKind(budget);
   if (gate === "cap") {
     return {
       file: relative,
       error:
-        `accepted edits leave ${relative} at ${budget.projected} tokens, ${budget.over} over the ` +
+        `accepted edits leave ${label} at ${budget.projected} tokens, ${budget.over} over the ` +
         `${capTokens}-token budget; choose a compatible set of edits`,
     };
   }
@@ -42,7 +61,7 @@ function acceptedSubsetBudgetFailure({ proposal, accepted, repo, capTokens, memo
     return {
       file: relative,
       error:
-        `${relative} is already ${budget.current - capTokens} tokens over the ${capTokens}-token budget, ` +
+        `${label} is already ${budget.current - capTokens} tokens over the ${capTokens}-token budget, ` +
         `so accepted edits must shrink it, but they change it by ${budget.delta >= 0 ? "+" : ""}${budget.delta} ` +
         "tokens; choose a compatible set of edits",
     };
@@ -101,9 +120,9 @@ function memoryFileSnapshot(proposal, repo) {
   };
 }
 
-function overBudgetWarning(relative, budget) {
+function overBudgetWarning(label, budget) {
   return (
-    `${relative} is still ${formatTokens(budget.over)} tokens over the ${formatTokens(budget.capTokens)}-token ` +
+    `${label} is still ${formatTokens(budget.over)} tokens over the ${formatTokens(budget.capTokens)}-token ` +
     "budget; run `backpass` again for the next shrink step"
   );
 }
@@ -172,13 +191,12 @@ function removeEmptyDirectories(directories) {
  * The only place in backpass that writes to the repo.
  *
  * Everything upstream is read-only analysis; a run only changes the weights here, after
- * a human accepted specific edits. Five gates run before the first byte is written:
- * the memory file must still be the file the proposal was measured against
- * (`memoryFileSnapshot`), the accepted subset must clear the same cap/shrink budget gate as
- * the full proposal (`budgetGateKind`), every accepted edit for a file must compose
- * against that file's single pre-write image, every created skill target must still be
- * absent, and accepted paths must resolve to distinct targets. Any of them failing writes
- * nothing and records no rejection.
+ * a human accepted specific edits. Before the first byte is written, the memory file and
+ * every decided non-memory target must still be the files the proposal measured; the
+ * accepted subset must clear the same cap/shrink budget gate as the full proposal
+ * (`budgetGateKind`); every accepted edit for a file must compose against that file's
+ * single pre-write image; every created skill target must still be absent; and accepted
+ * paths must resolve to distinct targets. Any failure writes nothing and records no rejection.
  *
  * A file is therefore applied all at once or not at all. Skills are written only after
  * every accepted edit has composed, and before the files that reference them.
@@ -208,17 +226,44 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     memoryText = snapshot.text;
   }
 
-  const budgetFailure = acceptedSubsetBudgetFailure({
-    proposal,
-    accepted,
-    repo,
-    capTokens: config.budgetTokens,
-    memoryText,
-  });
-  if (budgetFailure) {
-    results.failed.push(budgetFailure);
-    return results;
+  // The always-loaded skill layer as it exists on disk right now - the budget below
+  // covers the whole surface, not the memory file alone.
+  const skillsDir = resolveOverflowTarget(
+    repo.root,
+    proposal.config?.skillsDir || config.skillsDir || CANONICAL_SKILLS_DIR,
+  ).dir;
+  const skillsNow = loadProjectSkills(repo.root, skillsDir);
+  const descriptionTokensNow = skillDescriptionTokens(skillsNow);
+
+  // Freshness for every non-memory file a decision targets, the same contract the
+  // memory file gets: each hunk was cut from one exact image, and a file that changed
+  // since no longer contains what the proposal describes - refuse, never patch blind.
+  // Proposals from before the field existed carry no hashes and are left alone.
+  const expectedTargetHashes = new Map((proposal.targetFiles ?? []).map((t) => [t.file, t.hash]));
+  const checkedTargets = new Set();
+  for (const edit of [...accepted, ...rejected]) {
+    const relative = edit.file;
+    if (!relative || relative === proposal.memoryFile?.path || checkedTargets.has(relative)) continue;
+    checkedTargets.add(relative);
+    const expected = expectedTargetHashes.get(relative);
+    if (!expected) continue;
+    const absolute = path.join(repo.root, relative);
+    if (!fs.existsSync(absolute)) {
+      results.failed.push({ file: relative, error: "file does not exist" });
+      continue;
+    }
+    const observed = memoryTextHash(fs.readFileSync(absolute, "utf8"));
+    if (observed !== expected) {
+      results.failed.push({
+        file: relative,
+        error:
+          `${relative} changed after this proposal was made (${expected} -> ${observed}), so its edits ` +
+          `no longer describe the file on disk; nothing was written. Run \`backpass\` to re-propose ` +
+          `against the current repository.`,
+      });
+    }
   }
+  if (results.failed.length) return results;
 
   for (const edit of accepted) {
     if (!byFile.has(edit.file)) byFile.set(edit.file, []);
@@ -315,6 +360,32 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
   }
   if (results.failed.length) return results;
 
+  const existingSkillPaths = new Set(skillsNow.map((skill) => skill.path));
+  let descriptionTokensProjected = descriptionTokensNow;
+  for (const item of resolvedPlanned) {
+    if (!existingSkillPaths.has(item.relative)) continue;
+    descriptionTokensProjected += descriptionTokensIn(item.text) - descriptionTokensIn(item.before);
+  }
+  descriptionTokensProjected += plannedSkills.reduce(
+    (sum, { skill }) => sum + estimateTokens(skill.description || ""),
+    0,
+  );
+  const memoryPlan = resolvedPlanned.find((item) => item.relative === proposal.memoryFile.path);
+  if (accepted.length) {
+    const budgetFailure = acceptedSubsetBudgetFailure({
+      proposal,
+      capTokens: config.budgetTokens,
+      memoryText,
+      projectedMemoryText: memoryPlan?.text ?? memoryText,
+      descriptionTokensNow,
+      descriptionTokensProjected,
+    });
+    if (budgetFailure) {
+      results.failed.push(budgetFailure);
+      return results;
+    }
+  }
+
   const canonical = plannedSkills.find(
     ({ skill }) => skill.path === CANONICAL_SKILLS_DIR || skill.path.startsWith(`${CANONICAL_SKILLS_DIR}/`),
   );
@@ -395,9 +466,17 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     }
     results.written = [];
   };
+  const landedDescriptionDelta = descriptionTokensProjected - descriptionTokensNow;
+  const budgetTarget = memoryPlan || orderedPlanned[0];
+  const surfaceBudget = budgetTarget
+    ? budgetStatus(memoryText, memoryPlan?.text ?? memoryText, config.budgetTokens, {
+        current: descriptionTokensNow,
+        projected: descriptionTokensNow + landedDescriptionDelta,
+      })
+    : null;
   for (const item of orderedPlanned) {
-    const { relative, resolved, before, text, applied } = item;
-    const budget = relative === proposal.memoryFile.path ? budgetStatus(before, text, config.budgetTokens) : null;
+    const { relative, resolved, text, applied } = item;
+    const budget = item === budgetTarget ? surfaceBudget : null;
 
     let commit = null;
     try {
@@ -413,9 +492,18 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     }
     committed.push({ ...item, commit });
     results.written.push({ file: relative, edits: applied, budget, dryRun });
+  }
 
-    // Shrinking over several runs is the design, so this is a heading, not a failure.
-    if (budget && !budget.withinBudget) results.warnings.push(overBudgetWarning(relative, budget));
+  if (surfaceBudget && !surfaceBudget.withinBudget) {
+    results.warnings.push(
+      overBudgetWarning(
+        surfaceLabel(
+          proposal.memoryFile.path,
+          Math.max(descriptionTokensNow, descriptionTokensNow + landedDescriptionDelta),
+        ),
+        surfaceBudget,
+      ),
+    );
   }
 
   if (!dryRun && canonical) {

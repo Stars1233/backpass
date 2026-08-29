@@ -8,7 +8,13 @@ import { State } from "../src/state.js";
 import { parseMemoryUnits } from "../src/memory.js";
 import { foldForRun } from "../src/commands/propose.js";
 import { foldEvidence, renderEvidenceForPrompt } from "../src/fold.js";
-import { gapEntryId, mergeGapEntries, pruneGapLedger, recordGapObservations } from "../src/gap-ledger.js";
+import {
+  gapEntryId,
+  ledgerGapObservations,
+  mergeGapEntries,
+  pruneGapLedger,
+  recordGapObservations,
+} from "../src/gap-ledger.js";
 
 const MEMORY_PATH = "AGENTS.md";
 const DAY = 86_400_000;
@@ -131,6 +137,21 @@ function age(h, days) {
   }
   h.state.writeGapLedger(ledger);
 }
+
+test("a later uncited observation preserves the session's failed-trigger citation", () => {
+  const phrasing = "Wrap migrations in a transaction.";
+  const citedThenUncited = (id) =>
+    record(id, [{ proposedInstruction: phrasing, coveredBySkill: "db-schema" }, { proposedInstruction: phrasing }]);
+  const ledger = { version: 1, entries: {} };
+
+  recordGapObservations(ledger, [citedThenUncited("s1"), citedThenUncited("s2")]);
+  const observations = ledgerGapObservations(ledger, MEMORY_PATH, [{ name: "db-schema" }]);
+  const summary = foldEvidence([], { gapObservations: observations, minGapEvidence: 2 });
+
+  assert.equal(observations.length, 2);
+  assert.equal(summary.gaps[0].failedTriggerSkill, "db-schema");
+  assert.equal(summary.gaps[0].failedTriggerSessions, 2);
+});
 
 test("a sighting older than gapLedgerMaxAge expires instead of resurfacing indefinitely", async () => {
   const h = harness({ gapLedgerMaxAge: "90d" });
@@ -272,6 +293,25 @@ test("mergeGapEntries unions sessions without double-counting and keeps the shor
   assert.deepEqual(Object.keys(entries[0].sessions).sort(), ["s1", "s2", "shared"], "a session never counts twice");
 });
 
+test("mergeGapEntries preserves absorbed citations for duplicate sessions", () => {
+  const targetId = "a".repeat(16);
+  const absorbedId = "b".repeat(16);
+  const ledger = ledgerWith(
+    { id: targetId, text: "Check the database contract before changing queries.", sessions: ["s1", "s2"] },
+    { id: absorbedId, text: "Read schema docs before SQL edits.", sessions: ["s1", "s2"] },
+  );
+  ledger.entries[absorbedId].sessions.s1.coveredBySkill = "db-schema";
+  ledger.entries[absorbedId].sessions.s2.coveredBySkill = "db-schema";
+
+  mergeGapEntries(ledger, [[targetId, absorbedId]]);
+  const observations = ledgerGapObservations(ledger, MEMORY_PATH, [{ name: "db-schema" }]);
+  const summary = foldEvidence([], { gapObservations: observations, minGapEvidence: 2 });
+
+  assert.equal(observations.length, 2, "each session remains one observation");
+  assert.equal(summary.gaps[0].failedTriggerSkill, "db-schema");
+  assert.equal(summary.gaps[0].failedTriggerSessions, 2);
+});
+
 test("merged gap identities remain durable as the canonical phrasing changes", () => {
   const first = "Always inspect the database schema documentation before composing a production SQL query.";
   const absorbed = "Consult schema before SQL.";
@@ -334,4 +374,112 @@ test("mergeGapEntries drops what it cannot verify instead of guessing", () => {
   assert.equal(twice, 1, "only the first group merged");
   assert.ok(!ledger.entries["b".repeat(16)], "b was absorbed into a");
   assert.ok(ledger.entries["c".repeat(16)], "c stayed untouched");
+});
+
+test("failed-trigger evidence survives skill body edits", () => {
+  const phrasing = "Run pnpm lint before committing changes.";
+  const citedSkill = {
+    name: "lint-ritual",
+    path: ".agents/skills/lint-ritual/SKILL.md",
+    description: "Load before committing.",
+    body: `- ${phrasing}\n`,
+  };
+  const ledger = { version: 1, entries: {} };
+  recordGapObservations(ledger, [record("s1", [{ proposedInstruction: phrasing, coveredBySkill: "lint-ritual" }])], {
+    skills: [citedSkill],
+  });
+
+  const entry = Object.values(ledger.entries)[0];
+  assert.equal(Object.values(entry.sessions)[0].coveredBySkill, "lint-ritual");
+  assert.equal(ledgerGapObservations(ledger, MEMORY_PATH, [citedSkill])[0].coveredBySkill, "lint-ritual");
+
+  const unchanged = pruneGapLedger(ledger, {
+    memoryFile: memoryFile(),
+    memoryPath: MEMORY_PATH,
+    maxAge: "all",
+    skills: [citedSkill],
+  });
+  assert.equal(unchanged.covered, 0, "the cited pre-existing body is evidence of a failed trigger");
+  assert.equal(Object.keys(ledger.entries).length, 1);
+
+  const unrelatedEdit = { ...citedSkill, body: `# Notes\n\nUnrelated details changed.\n\n- ${phrasing}\n` };
+  recordGapObservations(ledger, [record("s1", [{ proposedInstruction: phrasing, coveredBySkill: "lint-ritual" }])], {
+    skills: [unrelatedEdit],
+  });
+  const afterUnrelatedEdit = pruneGapLedger(ledger, {
+    memoryFile: memoryFile(),
+    memoryPath: MEMORY_PATH,
+    maxAge: "all",
+    skills: [unrelatedEdit],
+  });
+  assert.equal(afterUnrelatedEdit.covered, 0, "an unrelated body edit preserves the failed-trigger evidence");
+
+  const rewrittenBody = {
+    ...unrelatedEdit,
+    body: "# Notes\n\nUnrelated details changed.\n\n- Run pnpm lint before committing changes every time.\n",
+  };
+  const afterBodyRewrite = pruneGapLedger(ledger, {
+    memoryFile: memoryFile(),
+    memoryPath: MEMORY_PATH,
+    maxAge: "all",
+    skills: [rewrittenBody],
+  });
+  assert.equal(afterBodyRewrite.covered, 0, "body edits never invalidate judged failed-trigger evidence");
+  assert.equal(Object.keys(ledger.entries).length, 1);
+
+  const descriptionFixed = { ...rewrittenBody, description: phrasing };
+  const afterDescriptionFix = pruneGapLedger(ledger, {
+    memoryFile: memoryFile(),
+    memoryPath: MEMORY_PATH,
+    maxAge: "all",
+    skills: [descriptionFixed],
+  });
+  assert.equal(afterDescriptionFix.covered, 1, "a covering description retires the resolved failed trigger");
+  assert.deepEqual(ledger.entries, {});
+});
+
+test("a missing skill suppresses its citation while body edits preserve judged citations", () => {
+  const phrasing = "Run pnpm lint before committing changes.";
+  const citedSkill = {
+    name: "lint-ritual",
+    path: ".agents/skills/lint-ritual/SKILL.md",
+    description: "Load before committing.",
+    body: `- ${phrasing}\n`,
+  };
+  const ledger = { version: 1, entries: {} };
+  recordGapObservations(
+    ledger,
+    [
+      record("s1", [{ proposedInstruction: phrasing, coveredBySkill: "lint-ritual" }]),
+      record("s2", [{ proposedInstruction: phrasing, coveredBySkill: "lint-ritual" }]),
+    ],
+    { skills: [citedSkill] },
+  );
+
+  const missing = ledgerGapObservations(ledger, MEMORY_PATH, []);
+  assert.equal(missing.length, 2);
+  assert.ok(missing.every((observation) => observation.coveredBySkill === undefined));
+
+  const bodyEdited = ledgerGapObservations(ledger, MEMORY_PATH, [
+    { ...citedSkill, body: "- Run the formatter before committing.\n" },
+  ]);
+  assert.equal(bodyEdited.length, 2);
+  assert.ok(bodyEdited.every((observation) => observation.coveredBySkill === "lint-ritual"));
+  assert.equal(Object.values(ledger.entries)[0].sessions.s1.coveredBySkill, "lint-ritual");
+  assert.equal(Object.values(ledger.entries)[0].sessions.s2.coveredBySkill, "lint-ritual");
+});
+
+test("a skill's description line alone can cover a gap", () => {
+  const phrasing = "Always inspect schema documentation before SQL.";
+  const ledger = { version: 1, entries: {} };
+  recordGapObservations(ledger, [record("s1", [phrasing])]);
+
+  const stats = pruneGapLedger(ledger, {
+    memoryFile: memoryFile(),
+    memoryPath: MEMORY_PATH,
+    maxAge: "all",
+    skills: [{ description: "Always inspect schema documentation before writing SQL.", body: "" }],
+  });
+  assert.equal(stats.covered, 1);
+  assert.deepEqual(ledger.entries, {});
 });
