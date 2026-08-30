@@ -388,12 +388,32 @@ test("explicit config or CLI flags pin the role and skip the ladder entirely", a
   );
   assert.deepEqual(calls, [], "nothing was probed");
 
-  // A pinned agent is the user's decision: an auth failure surfaces, it does not fall through.
+  // A pinned agent is the user's decision: an auth failure surfaces as a UserError, it does not fall through.
   await assert.rejects(
     resolver.withFallthrough("synthesis", async () => {
       throw authRequired("claude");
     }),
-    AcpxError,
+    (err) => {
+      assert.ok(err instanceof UserError);
+      assert.match(err.message, /pinned synthesis agent claude/);
+      assert.match(err.message, /not logged in/);
+      assert.match(err.hint, /claude auth login/);
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    resolver.withFallthrough("synthesis", async () => {
+      throw new AcpxError("acpx claude could not enable write session mode=agent: unsupported command");
+    }),
+    (err) => {
+      assert.ok(err instanceof UserError);
+      assert.match(err.message, /pinned synthesis agent claude/);
+      assert.match(err.message, /failed unexpectedly/);
+      assert.match(err.message, /unsupported command/);
+      assert.match(err.hint, /check the claude\/acpx failure above and retry/);
+      return true;
+    },
   );
 });
 

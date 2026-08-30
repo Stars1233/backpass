@@ -29,10 +29,15 @@ const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-harness-bin-"));
 const fakeAcpx = path.join(binDir, "acpx");
 const fakePi = path.join(binDir, "pi");
 const fakeGrok = path.join(binDir, "grok");
+const fakeCodex = path.join(binDir, "codex");
+const adapterModules = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-codex-adapter-"));
+const adapterBin = path.join(adapterModules, ".bin");
+const bundledCodex = path.join(adapterModules, "@openai", "codex", "bin", "codex.js");
 const settingsPath = path.join(fakeHome, ".pi", "agent", "settings.json");
 const acpxLog = path.join(binDir, "acpx.log");
 const piLog = path.join(binDir, "pi.log");
 const grokLog = path.join(binDir, "grok.log");
+const codexLog = path.join(binDir, "codex.log");
 const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-harness-cwd-")));
 
 const ORIGINAL_SETTINGS = `{
@@ -75,16 +80,32 @@ process.exit(0);
 );
 fs.chmodSync(fakeGrok, 0o755);
 
+const codexScript = `#!${process.execPath}
+const fs = require("node:fs");
+fs.appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
+process.exit(0);
+`;
+fs.writeFileSync(fakeCodex, codexScript);
+fs.chmodSync(fakeCodex, 0o755);
+fs.mkdirSync(path.dirname(bundledCodex), { recursive: true });
+fs.mkdirSync(adapterBin, { recursive: true });
+fs.writeFileSync(bundledCodex, codexScript);
+fs.chmodSync(bundledCodex, 0o755);
+
 fs.writeFileSync(
   fakeAcpx,
   `#!${process.execPath}
 const fs = require("node:fs");
+const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const argv = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_ACPX_LOG, JSON.stringify({
   argv,
   cwd: process.cwd(),
   PI_ACP_PI_COMMAND: process.env.PI_ACP_PI_COMMAND || null,
+  INITIAL_AGENT_MODE: process.env.INITIAL_AGENT_MODE || null,
+  CODEX_CONFIG: process.env.CODEX_CONFIG || null,
+  CODEX_PATH: process.env.CODEX_PATH || null,
 }) + "\\n");
 const settings = process.env.FAKE_HARNESS_SETTINGS;
 if (argv.includes("config") && argv.includes("show")) {
@@ -93,6 +114,7 @@ if (argv.includes("config") && argv.includes("show")) {
   process.stdout.write(JSON.stringify({ agents }) + "\\n");
   process.exit(0);
 }
+if (argv.includes("set-mode")) process.exit(0);
 const setAt = argv.indexOf("set");
 if (setAt >= 0) {
   const key = argv[setAt + 1];
@@ -105,6 +127,15 @@ function spawnWrappedPi() {
   const wrap = process.env.PI_ACP_PI_COMMAND;
   if (!wrap) return;
   spawnSync(wrap, ["--mode", "rpc", "--no-themes"], { stdio: "ignore", env: process.env });
+}
+function spawnWrappedCodex() {
+  const wrap = process.env.CODEX_PATH;
+  if (!wrap) return;
+  const env = { ...process.env };
+  if (env.FAKE_CODEX_ADAPTER_BIN) {
+    env.PATH = env.FAKE_CODEX_ADAPTER_BIN + path.delimiter + (env.PATH || "");
+  }
+  spawnSync(wrap, ["app-server"], { stdio: "ignore", env });
 }
 function splitAgentCommand(value) {
   const parts = [];
@@ -152,6 +183,7 @@ if (argv.includes("sessions") && argv.includes("new")) {
     process.exit(2);
   }
   spawnWrappedPi();
+  spawnWrappedCodex();
   spawnOverriddenAgent();
   process.exit(0);
 }
@@ -172,13 +204,19 @@ fs.chmodSync(fakeAcpx, 0o755);
 
 process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH || ""}`;
 process.env.BACKPASS_ACPX_BIN = fakeAcpx;
+delete process.env.CODEX_PATH;
+delete process.env.INITIAL_AGENT_MODE;
+delete process.env.CODEX_CONFIG;
 process.env.FAKE_ACPX_LOG = acpxLog;
 process.env.FAKE_PI_LOG = piLog;
 process.env.FAKE_GROK_LOG = grokLog;
+process.env.FAKE_CODEX_LOG = codexLog;
+process.env.FAKE_CODEX_ADAPTER_BIN = adapterBin;
 process.env.FAKE_HARNESS_SETTINGS = settingsPath;
 fs.writeFileSync(acpxLog, "");
 fs.writeFileSync(piLog, "");
 fs.writeFileSync(grokLog, "");
+fs.writeFileSync(codexLog, "");
 
 const { execOneShot, openSession, sessionPrompt } = await import("../src/acpx.js");
 const { prepareHarnessInvocation } = await import("../src/harness-invoke.js");
@@ -191,6 +229,7 @@ function resetLogsAndSettings() {
   fs.writeFileSync(acpxLog, "");
   fs.writeFileSync(piLog, "");
   fs.writeFileSync(grokLog, "");
+  fs.writeFileSync(codexLog, "");
 }
 
 function settingsBytes() {
@@ -560,6 +599,9 @@ test("Codex session passes --model at create and ACP set reasoning_effort, never
   const created = calls.find((c) => c.argv.includes("new"));
   assert.equal(created.argv[created.argv.indexOf("--model") + 1], "gpt-5.6-sol");
   assert.deepEqual(setCalls(calls).map(setKey), ["reasoning_effort"]);
+  assert.equal(created.INITIAL_AGENT_MODE, null);
+  assert.ok(!calls.some((c) => c.argv.includes("set-mode")));
+  assert.deepEqual(jsonl(codexLog), []);
 });
 
 test("OpenCode session passes --model at create, skips effort, and does not persist", async () => {
@@ -628,6 +670,123 @@ test("Grok session forces an acpx raw-command override with process model and ef
   assert.ok(spawned.length >= 1);
   assert.deepEqual(spawned[0].slice(0, 4), ["-m", "grok-4.6", "--reasoning-effort", "high"]);
   assert.deepEqual(spawned[0].slice(4), ["agent", "stdio"]);
+});
+
+test("a write-access Codex session enables code-mode on the spawn, not by rewriting config.toml", async () => {
+  resetLogsAndSettings();
+  process.env.CODEX_CONFIG = JSON.stringify({ features: { foo: true }, model: "keep-me" });
+  try {
+    const session = await openSession({
+      agent: "codex",
+      model: "gpt-5.6-sol",
+      effort: "high",
+      sessionName: "bp-codex-write",
+      cwd: workDir,
+      writeAccess: true,
+    });
+    await session.close();
+  } finally {
+    delete process.env.CODEX_CONFIG;
+  }
+
+  const calls = acpxCalls();
+  const created = calls.find((c) => c.argv.includes("new"));
+  assert.equal(created.INITIAL_AGENT_MODE, "agent");
+  const config = JSON.parse(created.CODEX_CONFIG);
+  assert.equal(config.features.code_mode_host, true);
+  assert.equal(config.features.foo, true);
+  assert.equal(config.model, "keep-me");
+  assert.ok(created.CODEX_PATH);
+  assert.notEqual(created.CODEX_PATH, fakeCodex);
+  assert.ok(calls.some((c) => c.argv.includes("set-mode") && c.argv.includes("agent")));
+  assert.deepEqual(setCalls(calls).map(setKey), ["reasoning_effort"]);
+  assert.deepEqual(jsonl(codexLog)[0], ["--enable", "code_mode_host", "app-server"]);
+});
+
+test("write-access Codex wraps the adapter's bundled executable when codex is absent from PATH", async () => {
+  resetLogsAndSettings();
+  const originalPath = process.env.PATH;
+  const nodeOnlyBin = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-node-only-"));
+  fs.symlinkSync(process.execPath, path.join(nodeOnlyBin, "node"));
+  process.env.PATH = nodeOnlyBin;
+  try {
+    const session = await openSession({
+      agent: "codex",
+      sessionName: "bp-codex-bundled",
+      cwd: workDir,
+      writeAccess: true,
+    });
+    await session.close();
+  } finally {
+    process.env.PATH = originalPath;
+  }
+
+  assert.deepEqual(jsonl(codexLog), [["--enable", "code_mode_host", "app-server"]]);
+});
+
+test("a write-access Codex session rejects malformed CODEX_CONFIG before invoking acpx", async () => {
+  resetLogsAndSettings();
+  process.env.CODEX_CONFIG = "{not-json";
+  try {
+    await assert.rejects(
+      openSession({
+        agent: "codex",
+        sessionName: "bp-codex-invalid-config",
+        cwd: workDir,
+        writeAccess: true,
+      }),
+      {
+        name: "UserError",
+        message: /CODEX_CONFIG is not valid JSON/,
+        hint: /unset CODEX_CONFIG or set it to a valid JSON object/,
+      },
+    );
+  } finally {
+    delete process.env.CODEX_CONFIG;
+  }
+
+  assert.deepEqual(acpxCalls(), []);
+});
+
+test("a write-access Grok session launches with native file-write permission flags", async () => {
+  resetLogsAndSettings();
+  const session = await openSession({
+    agent: "grok",
+    model: "grok-4.6",
+    effort: "high",
+    sessionName: "bp-grok-write",
+    cwd: workDir,
+    writeAccess: true,
+  });
+  await session.close();
+  const spawned = jsonl(grokLog);
+  assert.ok(spawned.length >= 1);
+  assert.deepEqual(spawned[0].slice(0, 5), [
+    "--always-approve",
+    "--permission-mode",
+    "bypassPermissions",
+    "--sandbox",
+    "workspace",
+  ]);
+  assert.deepEqual(spawned[0].slice(5, 9), ["-m", "grok-4.6", "--reasoning-effort", "high"]);
+});
+
+test("a write-access Pi session does not invent a permission overlay", async () => {
+  resetLogsAndSettings();
+  const session = await openSession({
+    agent: "pi",
+    model: "openai-codex/gpt-5.6-sol",
+    effort: "high",
+    sessionName: "bp-pi-write",
+    cwd: workDir,
+    writeAccess: true,
+  });
+  await session.close();
+  const spawned = jsonl(piLog);
+  assert.deepEqual(spawned[0].slice(0, 4), ["--model", "openai-codex/gpt-5.6-sol", "--thinking", "high"]);
+  assert.ok(!spawned[0].includes("--tools"));
+  const calls = acpxCalls();
+  assert.ok(!calls.some((c) => c.argv.includes("set-mode")));
 });
 
 test("Pi and Grok retain process effort when session fallback uses exec", async () => {
