@@ -5,6 +5,7 @@ import { UserError, color, info, json, out, warn } from "../logger.js";
 import { resolveMemoryFiles } from "../memory.js";
 import { emitProgress } from "../progress.js";
 import { ProposalViolation } from "../proposal.js";
+import { capTranscripts } from "../sample.js";
 import { synthesizeProposal } from "../synthesize.js";
 import { budgetBar, formatTokens } from "../tokens.js";
 import { discoverForRun } from "./scan.js";
@@ -44,7 +45,7 @@ export async function bootstrapRun(ctx, deps = {}) {
   const fold = deps.fold || foldForRun;
   const { canonical, pointer } = bootstrapTargets(config.memoryFiles);
 
-  const { transcripts, perHarness } = await discover(ctx);
+  const { transcripts, perHarness } = capTranscripts(await discover(ctx), config);
   info(
     `${color.yellow("·")} no memory file found (looked for ${config.memoryFiles.join(", ")}) - ` +
       `bootstrapping ${canonical} from ${transcripts.length} transcript(s) + defaults`,
@@ -102,7 +103,7 @@ export async function bootstrapRun(ctx, deps = {}) {
       `${result.summary.skipped} too short · ${result.summary.failed} failed`,
   );
 
-  const folded = await fold(ctx, memoryFile, memoryHash);
+  const folded = await fold(ctx, memoryFile, memoryHash, [], transcripts);
   config.state.writeSummary(folded);
   emitProgress("fold:done", {
     instructions: folded.instructions.length,

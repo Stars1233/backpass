@@ -3,35 +3,56 @@ import { foldEvidence } from "../fold.js";
 import { ledgerGapObservations, pruneGapLedger, recordGapObservations } from "../gap-ledger.js";
 import { synthesizeProposal } from "../synthesize.js";
 import { ProposalViolation } from "../proposal.js";
+import { formatCorpusMix, INTERACTIVE, NON_INTERACTIVE } from "../interaction.js";
 import { UserError, color, info, json, out, terminalSafe } from "../logger.js";
 import { budgetBar, formatTokens } from "../tokens.js";
 import { emitProgress } from "../progress.js";
 import { primaryMemoryFile } from "./analyze.js";
 import { printUsage } from "./usage.js";
 import { discoverForRun } from "./scan.js";
+import { capTranscripts } from "../sample.js";
+import { transcriptIdentity } from "../transcript.js";
 
 /**
- * Fold on-disk evidence for the memory surface. Gap corroboration is counted through the
- * persisted ledger so sessions accumulate across runs: record this run's observations,
- * prune what the current surface now covers or what aged out (after recording, because
+ * Fold on-disk evidence for the memory surface. Gap sightings persist across runs, but
+ * corroboration is bounded to sessions in this run's selected sample: record this run's
+ * observations, prune what the current surface now covers or what aged out (after recording, because
  * the evidence files that fed an expired sighting are still on disk and would re-add it),
  * then cluster from the ledger.
  *
- * Evidence is also filtered to `memoryHash`: a transcript's evidence file is rewritten
- * every time it is re-analyzed against a changed memory file or skill description, but a
- * transcript that fell out of this run's sample (window, cap, or discovery drift) leaves
- * its last evidence file on disk under whatever hash it was last judged against. That
- * leftover file is real and reusable the moment its transcript is re-analyzed - or
- * immediately, if the memory surface returns to that hash - but folding it into *this*
- * proposal would score it against
- * an instruction index it was never judged against (aliases are positional) and inflate
- * `analyzedSessions` with a session this run never touched. Nothing is migrated, rewritten,
- * or deleted here - only excluded from this run's fold.
+ * Evidence is filtered to the selected transcript identities, `memoryHash`, and a valid
+ * interaction category. Reanalysis rewrites a transcript's evidence against a changed
+ * memory file or skill description, but records outside this run's window or cap remain
+ * on disk. Folding those records would inflate `analyzedSessions` beyond the sampled
+ * corpus; folding another surface's record would also score positional instruction aliases
+ * against an index it never saw. Legacy records without a valid interaction category stay
+ * excluded until ordinary discovery and analysis select and backfill them.
  */
-export async function foldForRun(ctx, memoryFile, memoryHash, skills = []) {
+export async function foldForRun(ctx, memoryFile, memoryHash, skills = [], transcripts = []) {
   const { state, minGapEvidence, gapLedgerMaxAge } = ctx.config;
+  const selected = new Set(transcripts.map((transcript) => transcriptIdentity(transcript)));
   const evidence = state.listEvidence();
-  const relevant = evidence.filter((e) => e.memoryPath === memoryFile.path && e.memoryHash === memoryHash);
+  const identitiesByLegacyId = new Map();
+  for (const record of evidence) {
+    const legacyId = record.transcript?.id;
+    if (!legacyId) continue;
+    if (!identitiesByLegacyId.has(legacyId)) identitiesByLegacyId.set(legacyId, new Set());
+    identitiesByLegacyId.get(legacyId).add(transcriptIdentity(record.transcript));
+  }
+  const selectedGapSessions = new Set(selected);
+  for (const transcript of transcripts) {
+    const identities = identitiesByLegacyId.get(transcript.id);
+    if (identities?.size === 1 && identities.has(transcriptIdentity(transcript))) {
+      selectedGapSessions.add(transcript.id);
+    }
+  }
+  const relevant = evidence.filter(
+    (e) =>
+      e.memoryPath === memoryFile.path &&
+      e.memoryHash === memoryHash &&
+      (e.transcript?.interaction === INTERACTIVE || e.transcript?.interaction === NON_INTERACTIVE) &&
+      selected.has(transcriptIdentity(e.transcript)),
+  );
 
   const ledger = state.readGapLedger();
   recordGapObservations(ledger, relevant, { skills });
@@ -50,10 +71,13 @@ export async function foldForRun(ctx, memoryFile, memoryHash, skills = []) {
   pruneGapLedger(ledger, { memoryFile, memoryPath: memoryFile.path, skills, maxAge: gapLedgerMaxAge });
   state.writeGapLedger(ledger);
 
+  const gapObservations = ledgerGapObservations(ledger, memoryFile.path, skills).filter((observation) =>
+    selectedGapSessions.has(observation.sessionId),
+  );
   const summary = foldEvidence(relevant, {
     minGapEvidence,
     memoryFile,
-    gapObservations: ledgerGapObservations(ledger, memoryFile.path, skills),
+    gapObservations,
     skills,
   });
   summary.consolidation = consolidation;
@@ -73,10 +97,10 @@ export async function runProposal(ctx, precomputed = null) {
   // failures may leave an older proposal available to apply as if it came from this run.
   config.state.clearProposal();
   const { file, hash, skills } = precomputed || primaryMemoryFile(repo, config);
-  const transcripts = precomputed?.transcripts || (await discoverForRun(ctx)).transcripts;
+  const transcripts = precomputed?.transcripts || capTranscripts(await discoverForRun(ctx), config).transcripts;
 
   const foldStarted = Date.now();
-  const summary = await foldForRun(ctx, file, hash, skills ?? []);
+  const summary = await foldForRun(ctx, file, hash, skills ?? [], transcripts);
   config.state.writeSummary(summary);
   emitProgress("fold:done", {
     instructions: summary.instructions.length,
@@ -113,9 +137,10 @@ export async function runProposal(ctx, precomputed = null) {
  */
 export function printProposal(proposal, { applied = false, analysisUsage = [] } = {}) {
   out("");
+  const mix = proposal.stats.corpusMix ? ` · ${formatCorpusMix(proposal.stats.corpusMix)}` : "";
   out(
     `${color.bold("proposal")} · ${proposal.repo.name} · ${proposal.memoryFile.path} · ` +
-      `${proposal.edits.length} edit(s) from ${proposal.stats.transcripts} session(s)`,
+      `${proposal.edits.length} edit(s) from ${proposal.stats.transcripts} session(s)${mix}`,
   );
   out(
     `  budget ${budgetBar(proposal.budget)} ${formatTokens(proposal.budget.current)} -> ` +
