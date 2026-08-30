@@ -12,8 +12,7 @@ import {
 import { crossSurfaceDuplicates } from "../overlap.js";
 import { budgetBar, budgetStatus, formatTokens } from "../tokens.js";
 import { table } from "./scan.js";
-import { DEFAULT_EFFORT } from "../config.js";
-import { candidateKey, isProbeEntryFresh } from "../agents.js";
+import { candidateKey, isProbeEntryFresh, resolvedEffort } from "../agents.js";
 
 export async function cmdStatus(ctx) {
   const { repo, config } = ctx;
@@ -164,17 +163,23 @@ export async function cmdStatus(ctx) {
  */
 function describeRole(config, role) {
   const pinned = config.agents.pinned(role);
-  const effort = config[role].effort || DEFAULT_EFFORT[role];
   if (pinned) {
-    return `${pinned.agent}${pinned.model ? `/${pinned.model}` : ""} (effort ${effort}, ${pinned.reason})`;
+    return `${pinned.agent}${pinned.model ? `/${pinned.model}` : ""} (effort ${formatEffort(resolvedEffort(role, pinned.agent, config))}, ${pinned.reason})`;
   }
   const cache = config.state.readProbeCache();
   for (const candidate of config.agents.ladder(role)) {
     const entry = cache.entries[candidateKey(candidate)];
     if (!isProbeEntryFresh(entry)) continue;
     if (entry.verdict === "ok") {
-      return `${candidate.agent}/${entry.resolvedModel || candidate.model} (effort ${effort}, auto - probed ${entry.checkedAt.slice(0, 16).replace("T", " ")})`;
+      return `${candidate.agent}/${entry.resolvedModel || candidate.model} (effort ${formatEffort(resolvedEffort(role, candidate.agent, config))}, auto - probed ${entry.checkedAt.slice(0, 16).replace("T", " ")})`;
     }
   }
-  return color.dim(`auto - ${config.agents.ladder(role).length} candidates, none probed yet (effort ${effort})`);
+  const configured =
+    typeof config[role].effort === "string" && config[role].effort.trim() ? config[role].effort.trim() : null;
+  const count = `auto - ${config.agents.ladder(role).length} candidates, none probed yet`;
+  return color.dim(configured ? `${count} (effort ${configured})` : count);
+}
+
+function formatEffort(effort) {
+  return effort || "unset";
 }
