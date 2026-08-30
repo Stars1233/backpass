@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { UserError } from "./logger.js";
 
@@ -51,20 +52,189 @@ function listWorktrees(root) {
   return [...new Set(paths)];
 }
 
-function listRemotes(root) {
-  let raw;
+function networkRemoteIdentity(remote) {
+  let host;
+  let repositoryPath;
+
+  if (/^[a-z][a-z+.-]*:\/\//i.test(remote)) {
+    try {
+      const parsed = new URL(remote);
+      const defaultPorts = { "git:": "9418", "http:": "80", "https:": "443", "ssh:": "22" };
+      const port = parsed.port && parsed.port !== defaultPorts[parsed.protocol.toLowerCase()] ? `:${parsed.port}` : "";
+      host = `${parsed.hostname.toLowerCase()}${port}`;
+      repositoryPath = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    } catch {
+      return null;
+    }
+  } else {
+    const match = remote.match(/^(?:[^/@\s]+@)?([^/:\s]+):(.+)$/);
+    if (!match) return null;
+    host = match[1].toLowerCase();
+    repositoryPath = match[2];
+  }
+
+  repositoryPath = repositoryPath.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+  return host && repositoryPath ? `remote:${host}/${repositoryPath}` : null;
+}
+
+function cloneRemoteIdentity(remote, root) {
+  const value = String(remote || "").trim();
+  if (!value) return null;
+
+  if (/^file:\/\//i.test(value)) {
+    try {
+      return `local:${realpathOrSelf(fileURLToPath(value))}`;
+    } catch {
+      return null;
+    }
+  }
+  if (/^[a-z][a-z+.-]*:\/\//i.test(value) || /^(?:[^/@\s]+@)?[^/:\s]+:.+/.test(value)) {
+    return networkRemoteIdentity(value);
+  }
+
+  const expanded = expandUserPath(value);
+  const resolved = realpathOrSelf(path.isAbsolute(expanded) ? expanded : path.resolve(root, expanded));
+  return `local:${resolved}`;
+}
+
+function listRemoteUrls(root) {
+  let names;
   try {
-    raw = git(["remote", "-v"], root);
+    names = git(["remote"], root).split("\n").filter(Boolean);
   } catch {
     return [];
   }
-  const out = new Set();
-  for (const line of raw.split("\n")) {
-    const url = line.split(/\s+/)[1];
-    const norm = normalizeRemote(url);
-    if (norm) out.add(norm);
+
+  const urls = new Set();
+  for (const name of names) {
+    for (const args of [
+      ["remote", "get-url", "--all", name],
+      ["remote", "get-url", "--push", "--all", name],
+    ]) {
+      try {
+        for (const url of git(args, root).split("\n")) {
+          if (url) urls.add(url);
+        }
+      } catch {
+        continue;
+      }
+    }
   }
-  return [...out];
+  return [...urls];
+}
+
+function listRemotes(root) {
+  return [...new Set(listRemoteUrls(root).map(normalizeRemote).filter(Boolean))];
+}
+
+function listCloneRemotes(root) {
+  return [
+    ...new Set(
+      listRemoteUrls(root)
+        .map((remote) => cloneRemoteIdentity(remote, root))
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function expandUserPath(p) {
+  if (p === "~") return process.env.HOME || "";
+  if (typeof p === "string" && p.startsWith("~/")) {
+    return path.join(process.env.HOME || "", p.slice(2));
+  }
+  return p;
+}
+
+function isGitCheckout(dir) {
+  try {
+    return fs.existsSync(path.join(dir, ".git"));
+  } catch {
+    return false;
+  }
+}
+
+function remotesOverlap(ours, theirs) {
+  if (!ours.length || !theirs.length) return false;
+  const set = new Set(ours);
+  return theirs.some((remote) => set.has(remote));
+}
+
+/**
+ * Local checkouts that share a remote with this repo, plus their worktrees.
+ *
+ * Claude (and other harnesses that record cwd but no remote) only reach tier 1 when
+ * the cwd is a known live path. `git worktree list` cannot see a sibling clone's
+ * separate `.git`, so those sessions were invisible. Search is bounded and read-only:
+ * the parent of each of this repo's worktrees, each configured extra root, and the
+ * immediate children of those directories. Matching is remote identity, not directory
+ * name. Fail-soft: an unreadable path is skipped.
+ *
+ * @param {{ cloneRemotes?: string[], worktrees?: string[], cloneRoots?: string[], repoRoot?: string }} [opts]
+ */
+export function listSiblingCloneWorktrees({ cloneRemotes, worktrees, cloneRoots = [], repoRoot } = {}) {
+  if (!cloneRemotes?.length) return [];
+  const known = new Set(worktrees || []);
+  const found = [];
+
+  const consider = (dir) => {
+    let real;
+    try {
+      real = realpathOrSelf(dir);
+    } catch {
+      return;
+    }
+    if (known.has(real) || !isGitCheckout(real)) return;
+    const theirs = listCloneRemotes(real);
+    if (!remotesOverlap(cloneRemotes, theirs)) return;
+    for (const wt of listWorktrees(real)) {
+      if (known.has(wt)) continue;
+      known.add(wt);
+      found.push(wt);
+    }
+  };
+
+  const searchRoots = new Set();
+  for (const wt of worktrees || []) {
+    const parent = path.dirname(wt);
+    if (parent && parent !== wt) searchRoots.add(parent);
+  }
+  for (const extra of cloneRoots) {
+    const expanded = expandUserPath(extra);
+    if (!expanded) continue;
+    searchRoots.add(path.resolve(repoRoot || worktrees?.[0] || ".", expanded));
+  }
+
+  for (const root of searchRoots) {
+    consider(root);
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      consider(path.join(root, entry.name));
+    }
+  }
+
+  return found;
+}
+
+/**
+ * Fill `repo.siblingWorktrees` from local clones that share this repo's remotes.
+ *
+ * @param {{ root: string, cloneRemotes: string[], worktrees: string[], siblingWorktrees?: string[] }} repo
+ * @param {string[]} [cloneRoots]
+ */
+export function attachSiblingClones(repo, cloneRoots = []) {
+  repo.siblingWorktrees = listSiblingCloneWorktrees({
+    cloneRemotes: repo.cloneRemotes,
+    worktrees: repo.worktrees,
+    cloneRoots,
+    repoRoot: repo.root,
+  });
+  return repo;
 }
 
 /**
@@ -114,5 +284,7 @@ export function resolveRepo(cwd = process.cwd()) {
     name: path.basename(realRoot),
     worktrees: listWorktrees(root),
     remotes: listRemotes(root),
+    cloneRemotes: listCloneRemotes(root),
+    siblingWorktrees: [],
   };
 }

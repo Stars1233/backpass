@@ -1,9 +1,11 @@
 import { discoverTranscripts } from "../discovery/index.js";
 import { color, info, json, out } from "../logger.js";
+import { attachSiblingClones } from "../repo.js";
 
 /** Shared by every command that needs the transcript set. */
 export async function discoverForRun(ctx) {
   const { repo, config, strict } = ctx;
+  attachSiblingClones(repo, config.discovery.cloneRoots);
   const result = await discoverTranscripts({ repo, config, strict });
   if (ctx.limit && result.transcripts.length > ctx.limit) {
     result.truncated = result.transcripts.length - ctx.limit;
@@ -47,11 +49,12 @@ export async function cmdScan(ctx) {
   if (selfTotal) out(color.dim(`  SELF = backpass's own loss / gradient-descent sessions, excluded from the corpus`));
   out("");
 
-  const byTier = { 1: 0, 2: 0, 3: 0 };
+  const byTier = { 1: 0, 1.5: 0, 2: 0, 3: 0 };
   for (const t of transcripts) byTier[t.association.tier] += 1;
   out(
     `${transcripts.length} transcript(s) associated with this repo · ` +
-      `tier1 ${byTier[1]} (exact) · tier2 ${byTier[2]} (remote) · tier3 ${byTier[3]} (best-effort)`,
+      `tier1 ${byTier[1]} (exact) · tier1.5 ${byTier[1.5]} (sibling clone) · ` +
+      `tier2 ${byTier[2]} (remote) · tier3 ${byTier[3]} (best-effort)`,
   );
   if (byTier[3] && !ctx.strict) out(color.dim("  re-run with --strict to exclude the best-effort tier"));
   if (truncated) out(color.dim(`  --limit ${ctx.limit} is hiding ${truncated} more transcript(s)`));
