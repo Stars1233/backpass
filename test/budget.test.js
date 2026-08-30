@@ -2,7 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { budgetBar, budgetGateKind, budgetStatus, estimateTokens, formatTokens } from "../src/tokens.js";
-import { parseMemoryUnits, similarity, reanchor, unitHash } from "../src/memory.js";
+import {
+  ATTRIBUTION_SPLIT_TOKENS,
+  parseMemoryUnits,
+  renderInstructionIndex,
+  similarity,
+  reanchor,
+  unitHash,
+} from "../src/memory.js";
 import { extractionBudgetEffect, parseFrontmatter, renderSkillFile } from "../src/skills.js";
 
 test("token estimation prices UTF-8 bytes, not characters", () => {
@@ -91,6 +98,172 @@ test("a fenced code block stays one unit instead of splitting into lines", () =>
   const units = parseMemoryUnits(text);
   assert.equal(units.length, 1);
   assert.ok(units[0].text.includes("const b = 2;"));
+});
+
+function oversizedParagraph(count = 5) {
+  return Array.from(
+    { length: count },
+    (_, i) =>
+      `Sentence ${i + 1} states an independent requirement about builds, releases, adapters, and review that an agent must actually follow rather than skip.`,
+  ).join(" ");
+}
+
+test("an oversized paragraph keeps its positional alias and exposes sentence parts for attribution", () => {
+  const blob = oversizedParagraph();
+  const units = parseMemoryUnits(`# Memory\n\n${blob}\n\n- Keep the next unit's id stable.\n`);
+  assert.ok(estimateTokens(blob) > ATTRIBUTION_SPLIT_TOKENS);
+  assert.deepEqual(
+    units.map((u) => u.id),
+    ["AG-001", "AG-002"],
+    "later units keep positional aliases; parts are dotted, not extra AG-nnn ids",
+  );
+  assert.equal(units[1].text, "- Keep the next unit's id stable.");
+  assert.ok(units[0].parts?.length >= 2, "the blob splits on sentence boundaries");
+  assert.deepEqual(
+    units[0].parts.map((p) => p.id),
+    units[0].parts.map((_, i) => `AG-001.${i + 1}`),
+  );
+  assert.equal(units[0].parts[0].parentId, "AG-001");
+  assert.ok(units[0].parts.every((p) => p.startLine === units[0].startLine && p.endLine === units[0].endLine));
+  assert.ok(units[0].parts.every((p) => blob.includes(p.text)));
+
+  const index = renderInstructionIndex({ units });
+  assert.match(index, /Oversized paragraph AG-001/);
+  assert.match(index, /\[AG-001\.1\]/);
+  assert.match(index, /\[AG-001\.2\]/);
+  assert.match(index, /split the paragraph into list items/);
+  assert.match(index, /bold label on the blob is not a strengthen/);
+  assert.doesNotMatch(index, /\[AG-001\]/, "the blob itself is not an attribution target");
+});
+
+test("oversized Markdown-heavy paragraphs split realistic sentences without splitting abbreviations", () => {
+  const cycle =
+    "Review with Dr. Smith before release. `pnpm test` verifies behavior. deploy now checks lowercase commands. Écrivez les résultats clairement.";
+  const blob = Array.from({ length: 8 }, () => cycle).join(" ");
+  const [unit] = parseMemoryUnits(`# T\n\n${blob}\n`);
+
+  assert.ok(estimateTokens(blob) > ATTRIBUTION_SPLIT_TOKENS);
+  assert.ok(unit.parts?.length > 8);
+  assert.ok(unit.parts.some((part) => part.text.startsWith("`pnpm test`")));
+  assert.ok(unit.parts.some((part) => part.text.startsWith("deploy now")));
+  assert.ok(unit.parts.some((part) => part.text.startsWith("Écrivez")));
+  assert.ok(unit.parts.every((part) => part.text !== "Review with Dr."));
+  assert.ok(unit.parts.some((part) => part.text.startsWith("Review with Dr. Smith")));
+});
+
+test("the confidence segmenter handles abbreviations, Markdown endings, and short sentences", () => {
+  const cycle =
+    "Consult Capt. Smith before release. Run **checks**. Deploy safely. Run `pnpm test`. Deploy safely. Run checks. pnpm test verifies them.";
+  const blob = Array.from({ length: 8 }, () => cycle).join(" ");
+  const [unit] = parseMemoryUnits(`# T\n\n${blob}\n`);
+
+  assert.ok(estimateTokens(blob) > ATTRIBUTION_SPLIT_TOKENS);
+  assert.ok(unit.parts?.every((part) => part.text !== "Consult Capt."));
+  assert.ok(unit.parts?.some((part) => part.text === "Consult Capt. Smith before release."));
+  assert.ok(unit.parts?.some((part) => part.text === "Run **checks**."));
+  assert.ok(unit.parts?.some((part) => part.text === "Run `pnpm test`."));
+  assert.ok(unit.parts?.some((part) => part.text === "Run checks."));
+  assert.ok(unit.parts?.some((part) => part.text === "pnpm test verifies them."));
+});
+
+test("clear short sentences split regardless of segment length", () => {
+  const cycle = "Run checks. pnpm test verifies them.";
+  const blob = Array.from({ length: 20 }, () => cycle).join(" ");
+  const [unit] = parseMemoryUnits(`# T\n\n${blob}\n`);
+
+  assert.ok(estimateTokens(blob) > ATTRIBUTION_SPLIT_TOKENS);
+  assert.ok(unit.parts?.some((part) => part.text === "Run checks."));
+  assert.ok(unit.parts?.some((part) => part.text === "pnpm test verifies them."));
+});
+
+test("ambiguous abbreviations stay attached while clear sentence boundaries still split", () => {
+  const cycle = "See approx. Five checks follow. A clear requirement governs deployment.";
+  const blob = Array.from({ length: 12 }, () => cycle).join(" ");
+  const [unit] = parseMemoryUnits(`# T\n\n${blob}\n`);
+
+  assert.ok(estimateTokens(blob) > ATTRIBUTION_SPLIT_TOKENS);
+  assert.ok(unit.parts?.length > 12);
+  assert.ok(unit.parts.every((part) => part.text !== "See approx."));
+  assert.ok(unit.parts.some((part) => part.text === "See approx. Five checks follow."));
+  assert.ok(unit.parts.some((part) => part.text === "A clear requirement governs deployment."));
+});
+
+test("generic punctuation cannot suppress later clear attribution boundaries", () => {
+  const cycle =
+    "Keep retries < 3. Deploy safely. Verify results. Mark *critical text. Continue safely. Work from . Next verify.";
+  const blob = Array.from({ length: 12 }, () => cycle).join(" ");
+  const [unit] = parseMemoryUnits(`# T\n\n${blob}\n`);
+
+  assert.ok(estimateTokens(blob) > ATTRIBUTION_SPLIT_TOKENS);
+  assert.ok(unit.parts?.some((part) => part.text === "Keep retries < 3."));
+  assert.ok(unit.parts?.some((part) => part.text === "Deploy safely."));
+  assert.ok(unit.parts?.some((part) => part.text === "Verify results."));
+  assert.ok(unit.parts?.some((part) => part.text === "Continue safely."));
+  assert.ok(unit.parts?.some((part) => part.text === "Work from . Next verify."));
+});
+
+test("paths, URLs, and inline code do not create fragment attribution targets", () => {
+  const cycle =
+    'Read docs/config.md before editing. Read docs/config.md. Then verify the result. Read docs/config.md. src/main.js does the work. Read "C:\\Program Files\\Foo. Bar\\config" before editing. Read C:\\Program Files\\Foo. Bar\\config before editing. Read docs/Program Files/Foo. Bar/config before editing. Read docs/Foo. Bar Baz/config before editing. Visit https://example.test/docs/config.md before editing. Run `node app.js. --watch` afterward.';
+  const blob = Array.from({ length: 8 }, () => cycle).join(" ");
+  const [unit] = parseMemoryUnits(`# T\n\n${blob}\n`);
+
+  assert.ok(estimateTokens(blob) > ATTRIBUTION_SPLIT_TOKENS);
+  assert.ok(unit.parts?.length > 8);
+  assert.ok(unit.parts.some((part) => part.text === "Read docs/config.md before editing."));
+  assert.ok(unit.parts.some((part) => part.text === "Read docs/config.md."));
+  assert.ok(unit.parts.some((part) => part.text === "Then verify the result."));
+  assert.ok(unit.parts.every((part) => part.text !== "Read docs/config.md. Then verify the result."));
+  assert.ok(unit.parts.some((part) => part.text === "src/main.js does the work."));
+  assert.ok(unit.parts.every((part) => part.text !== "Read docs/config.md. src/main.js does the work."));
+  assert.ok(unit.parts.some((part) => part.text === 'Read "C:\\Program Files\\Foo. Bar\\config" before editing.'));
+  assert.ok(unit.parts.every((part) => part.text !== 'Read "C:\\Program Files\\Foo.'));
+  assert.ok(unit.parts.some((part) => part.text === "Read C:\\Program Files\\Foo. Bar\\config before editing."));
+  assert.ok(unit.parts.every((part) => part.text !== "Read C:\\Program Files\\Foo."));
+  assert.ok(unit.parts.some((part) => part.text === "Read docs/Program Files/Foo. Bar/config before editing."));
+  assert.ok(unit.parts.every((part) => part.text !== "Read docs/Program Files/Foo."));
+  assert.ok(unit.parts.some((part) => part.text === "Read docs/Foo. Bar Baz/config before editing."));
+  assert.ok(unit.parts.every((part) => part.text !== "Read docs/Foo."));
+  assert.ok(unit.parts.some((part) => part.text === "Visit https://example.test/docs/config.md before editing."));
+  assert.ok(unit.parts.some((part) => part.text === "Run `node app.js. --watch` afterward."));
+  assert.ok(unit.parts.every((part) => !part.text.startsWith("--watch`")));
+});
+
+test("URL-ending questions and exclamations remain sentence boundaries", () => {
+  const cycle =
+    "Is it https://example.com/docs? Check the result! Visit https://example.com/search?q=one!two before release. Follow AG-001.2 before editing.";
+  const blob = Array.from({ length: 8 }, () => cycle).join(" ");
+  const [unit] = parseMemoryUnits(`# T\n\n${blob}\n`);
+
+  assert.ok(estimateTokens(blob) > ATTRIBUTION_SPLIT_TOKENS);
+  assert.ok(unit.parts?.some((part) => part.text === "Is it https://example.com/docs?"));
+  assert.ok(unit.parts?.some((part) => part.text === "Check the result!"));
+  assert.ok(unit.parts?.some((part) => part.text === "Visit https://example.com/search?q=one!two before release."));
+  assert.ok(unit.parts?.some((part) => part.text === "Follow AG-001.2 before editing."));
+});
+
+test("an escaped literal backtick cannot disable sentence attribution", () => {
+  const blob =
+    "Write \\` for literal output. " +
+    Array.from({ length: 12 }, (_, i) => `Run check ${i + 1} before deployment. Deploy safely afterward.`).join(" ");
+  const [unit] = parseMemoryUnits(`# T\n\n${blob}\n`);
+
+  assert.ok(estimateTokens(blob) > ATTRIBUTION_SPLIT_TOKENS);
+  assert.ok(unit.parts?.length > 12);
+  assert.equal(unit.parts[0].text, "Write \\` for literal output.");
+  assert.ok(unit.parts.some((part) => part.text === "Deploy safely afterward."));
+});
+
+test("list items and fenced blocks are not sentence-split even when oversized", () => {
+  const blob = oversizedParagraph();
+  const listed = parseMemoryUnits(`# T\n\n- ${blob}\n`);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].id, "AG-001");
+  assert.equal(listed[0].parts, undefined);
+
+  const fenced = parseMemoryUnits(`# T\n\n\`\`\`\n${blob}\n\`\`\`\n`);
+  assert.equal(fenced.length, 1);
+  assert.equal(fenced[0].parts, undefined);
 });
 
 test("instruction hashes survive cosmetic reformatting but not meaning changes", () => {

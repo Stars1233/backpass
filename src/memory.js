@@ -12,9 +12,15 @@ import { estimateTokens } from "./tokens.js";
  *   - units come from list items and paragraphs inside those sections
  *   - each unit gets a content hash (survives cosmetic edits elsewhere in the file)
  *     and a readable alias AG-001, AG-002, ... used in prompts and evidence
+ *   - eligible prose above ATTRIBUTION_SPLIT_TOKENS is conservatively split at
+ *     high-confidence sentence boundaries into AG-nnn.m attribution parts; the parent
+ *     alias and line span stay put
  *
- * Evidence anchors to the alias; the hash is what lets us re-anchor across runs.
+ * Evidence anchors to an addressable instruction id; the hash lets it re-anchor across runs.
  */
+
+/** Eligible prose above this is too coarse to attribute and may get dotted sentence-part ids. */
+export const ATTRIBUTION_SPLIT_TOKENS = 120;
 
 const FENCE = /^\s*(```|~~~)/;
 
@@ -108,12 +114,174 @@ export function parseMemoryUnits(text) {
   }
   flush(lines.length);
 
-  return units.map((unit, index) => ({
-    id: alias(index),
-    hash: unitHash(unit.text),
-    tokens: estimateTokens(unit.text),
-    ...unit,
+  return units.map((unit, index) => {
+    const base = {
+      id: alias(index),
+      hash: unitHash(unit.text),
+      tokens: estimateTokens(unit.text),
+      ...unit,
+    };
+    const parts = attributionParts(base);
+    return parts ? { ...base, parts } : base;
+  });
+}
+
+function isListItemText(text) {
+  return /^\s*([-*+]|\d+[.)])\s+/m.test(text);
+}
+
+function unitHasFence(text) {
+  return text.split("\n").some((line) => FENCE.test(line));
+}
+
+const ABBREVIATIONS = new Set([
+  "approx",
+  "capt",
+  "cf",
+  "cmdr",
+  "col",
+  "dept",
+  "dr",
+  "e.g",
+  "etc",
+  "fig",
+  "gen",
+  "gov",
+  "i.e",
+  "inc",
+  "jr",
+  "lt",
+  "misc",
+  "mr",
+  "mrs",
+  "ms",
+  "no",
+  "prof",
+  "rep",
+  "rev",
+  "sen",
+  "sr",
+  "st",
+  "v",
+  "vs",
+]);
+
+function confidentSentenceBoundary(text, sentenceStart, terminator) {
+  let end = terminator + 1;
+  while (end < text.length && /["')\]}*_~\u2019\u201d]/u.test(text[end])) end += 1;
+  if (end >= text.length || !/\s/u.test(text[end])) return null;
+
+  let next = end;
+  while (next < text.length && /\s/u.test(text[next])) next += 1;
+  let visibleNext = next;
+  while (visibleNext < text.length && /["'([{*`_~\u2018\u201c]/u.test(text[visibleNext])) visibleNext += 1;
+  if (visibleNext >= text.length || !/[\p{L}\p{N}$@/\\]/u.test(text[visibleNext])) return null;
+
+  if (text[terminator] === ".") {
+    if (terminator === 0 || /\s/u.test(text[terminator - 1])) return null;
+    const beforeTerminator = text.slice(sentenceStart, terminator);
+    const precedingToken = beforeTerminator.match(/\S+$/u)?.[0] || "";
+    if (/[\\/]/u.test(precedingToken)) {
+      const nextTokens = text.slice(next).trimStart().split(/\s+/u).slice(0, 2).join(" ");
+      const finalPathSegment = precedingToken.split(/[\\/]/u).at(-1) || "";
+      const pathEndsWithExtension = /\.[\p{L}\p{N}]+$/u.test(finalPathSegment);
+      if (/[\\/]/u.test(nextTokens) && !pathEndsWithExtension) return null;
+    }
+    const rawPrefix = beforeTerminator.trim();
+    if (/^\d+$/u.test(rawPrefix)) return null;
+    const prefix = rawPrefix.replace(/["')\]}*`_~\u2019\u201d]+$/u, "");
+    const token = prefix.match(/([\p{L}\p{N}.]+)$/u)?.[1] || "";
+    if (!token) return null;
+    if (ABBREVIATIONS.has(token.toLowerCase()) || /^\p{L}$/u.test(token) || /^(?:\p{L}\.)+\p{L}$/u.test(token)) {
+      return null;
+    }
+  }
+
+  return { end, next };
+}
+
+export function splitAttributionSentences(text) {
+  const sentences = [];
+  let start = 0;
+  let codeDelimiter = 0;
+  let quotedPathEnd = -1;
+  for (let i = 0; i < text.length; i += 1) {
+    let backslashes = 0;
+    while (text[i - backslashes - 1] === "\\") backslashes += 1;
+    const escaped = backslashes % 2 === 1;
+
+    if (text[i] === "`") {
+      let run = 1;
+      while (text[i + run] === "`") run += 1;
+      if (!escaped) {
+        if (codeDelimiter === 0) codeDelimiter = run;
+        else if (codeDelimiter === run) codeDelimiter = 0;
+      }
+      i += run - 1;
+      continue;
+    }
+    if (codeDelimiter) continue;
+
+    if (i === quotedPathEnd) {
+      quotedPathEnd = -1;
+      continue;
+    }
+    if (quotedPathEnd > i) continue;
+    if (!escaped && ['"', "'"].includes(text[i])) {
+      let closing = i + 1;
+      while (closing < text.length) {
+        if (text[closing] === text[i] && text[closing - 1] !== "\\") break;
+        closing += 1;
+      }
+      const value = text.slice(i + 1, closing);
+      if (closing < text.length && /^(?:[A-Za-z]:[\\/]|\\\\|\.{0,2}[\\/]|~[\\/])|[\\/]/u.test(value)) {
+        quotedPathEnd = closing;
+        continue;
+      }
+    }
+
+    if (![".", "!", "?"].includes(text[i])) continue;
+    const boundary = confidentSentenceBoundary(text, start, i);
+    if (!boundary) continue;
+    sentences.push(text.slice(start, boundary.end).trim());
+    start = boundary.next;
+    i = boundary.next - 1;
+  }
+  sentences.push(text.slice(start).trim());
+  return sentences.length >= 2 ? sentences.filter(Boolean) : [];
+}
+
+function attributionParts(unit) {
+  if (unit.tokens <= ATTRIBUTION_SPLIT_TOKENS) return null;
+  if (isListItemText(unit.text) || unitHasFence(unit.text)) return null;
+  const sentences = splitAttributionSentences(unit.text);
+  if (sentences.length < 2) return null;
+  return sentences.map((text, index) => ({
+    id: `${unit.id}.${index + 1}`,
+    hash: unitHash(text),
+    tokens: estimateTokens(text),
+    text,
+    section: unit.section,
+    startLine: unit.startLine,
+    endLine: unit.endLine,
+    parentId: unit.id,
   }));
+}
+
+/** Addressable instructions for analysis, fold, and prompts: sentence parts when present. */
+export function instructionUnits(memoryFile) {
+  return (memoryFile?.units || []).flatMap((unit) => (unit.parts?.length ? unit.parts : [unit]));
+}
+
+/** Resolve an AG-nnn or AG-nnn.m id onto the parent unit or an attribution part. */
+export function findInstructionUnit(memoryFile, id) {
+  if (!memoryFile?.units || !id) return null;
+  for (const unit of memoryFile.units) {
+    if (unit.id === id) return unit;
+    const part = unit.parts?.find((candidate) => candidate.id === id);
+    if (part) return part;
+  }
+  return null;
 }
 
 /**
@@ -163,18 +331,36 @@ export function memorySurfaceHash(setHash, skills) {
   return `sha256:${sha256(`${setHash}|${layer}`).slice(0, 16)}`;
 }
 
+function formatIndexEntry(unit) {
+  const lines = unit.startLine === unit.endLine ? `L${unit.startLine}` : `L${unit.startLine}-${unit.endLine}`;
+  return `[${unit.id}] (${unit.tokens} tok, ${lines})${unit.section ? ` <${unit.section}>` : ""}\n${unit.text}`;
+}
+
 /**
  * Render the instruction index that both prompt tiers see. It is a lookup table keyed
  * by alias, never a stand-in for the file: units are listed with the lines they occupy
- * so the synthesis agent can find them in the raw file it edits.
+ * so the synthesis agent can find them in the raw file it edits. Oversized paragraphs
+ * retain an unbracketed positional AG-nnn alias for line-oriented edits and expose only
+ * their bracketed AG-nnn.m sentence parts as attribution targets.
  */
 export function renderInstructionIndex(file) {
-  return file.units
-    .map((u) => {
-      const lines = u.startLine === u.endLine ? `L${u.startLine}` : `L${u.startLine}-${u.endLine}`;
-      return `[${u.id}] (${u.tokens} tok, ${lines})${u.section ? ` <${u.section}>` : ""}\n${u.text}`;
-    })
-    .join("\n\n");
+  const blocks = [];
+  for (const unit of file.units) {
+    if (unit.parts?.length) {
+      const lines = unit.startLine === unit.endLine ? `L${unit.startLine}` : `L${unit.startLine}-${unit.endLine}`;
+      blocks.push(
+        `Oversized paragraph ${unit.id} (${unit.tokens} tok, ${lines})` +
+          `${unit.section ? ` <${unit.section}>` : ""} is one blob; ${unit.id} is only its line-oriented alias. ` +
+          `Attribute evidence only to the sentence-part IDs below ` +
+          `(${unit.parts.map((part) => part.id).join(", ")}). If these fail to steer, split the ` +
+          `paragraph into list items in place - a bold label on the blob is not a strengthen.`,
+      );
+      for (const part of unit.parts) blocks.push(formatIndexEntry(part));
+    } else {
+      blocks.push(formatIndexEntry(unit));
+    }
+  }
+  return blocks.join("\n\n");
 }
 
 export function similarityFeatures(text) {

@@ -1,5 +1,5 @@
 import { classifyInteraction, INTERACTIVE, NON_INTERACTIVE } from "./interaction.js";
-import { similarity } from "./memory.js";
+import { findInstructionUnit, instructionUnits, similarity } from "./memory.js";
 import { GAP_SIMILARITY_THRESHOLD, gapSource } from "./gap-ledger.js";
 import { crossSurfaceDuplicates } from "./overlap.js";
 
@@ -61,6 +61,7 @@ export function foldEvidence(
         sessions: new Set(),
         sessionsByInteraction: { [INTERACTIVE]: new Set(), [NON_INTERACTIVE]: new Set() },
         harmSessions: new Set(),
+        nonComplianceSessions: new Set(),
         quotes: [],
       });
     }
@@ -84,6 +85,9 @@ export function foldEvidence(
         // `harmSessions` is what the removal-evidence floor counts. A record from
         // before the class existed carries none and never counts as harm.
         if (polarity === "negative" && item.class === "harm") entry.harmSessions.add(sessionIdentity);
+        if (polarity === "negative" && item.class === "non-compliance") {
+          entry.nonComplianceSessions.add(sessionIdentity);
+        }
         entry.quotes.push({
           polarity,
           text: item.quote,
@@ -124,15 +128,18 @@ export function foldEvidence(
   // Instructions that exist in the file but drew no evidence at all are the strongest
   // removal / extraction candidates, so they must appear in the summary too.
   if (memoryFile) {
-    for (const unit of memoryFile.units) touch(unit.id);
+    for (const unit of instructionUnits(memoryFile)) touch(unit.id);
   }
 
   const duplicates = crossSurfaceDuplicates(memoryFile, skills);
   const overlapById = new Map(duplicates.map((hit) => [hit.instruction, hit]));
 
+  const parentHarmSessions = parentSessionCounts(memoryFile, instructions, "harmSessions");
+  const parentNonComplianceSessions = parentSessionCounts(memoryFile, instructions, "nonComplianceSessions");
+
   const instructionRows = [...instructions.values()]
     .map((entry) => {
-      const unit = memoryFile?.units.find((u) => u.id === entry.instruction) || null;
+      const unit = findInstructionUnit(memoryFile, entry.instruction);
       const skillOverlap = overlapById.get(entry.instruction);
       return {
         instruction: entry.instruction,
@@ -152,6 +159,9 @@ export function foldEvidence(
         tokens: unit?.tokens ?? null,
         section: unit?.section ?? null,
         known: Boolean(unit),
+        parentId: unit?.parentId ?? null,
+        nonCompliance: entry.quotes.filter((q) => q.polarity === "negative" && q.class === "non-compliance").length,
+        nonComplianceSessions: entry.nonComplianceSessions.size,
         quotes: entry.quotes.slice(0, 6),
         ...(skillOverlap ? { skillOverlap } : {}),
       };
@@ -206,10 +216,46 @@ export function foldEvidence(
       crossSurfaceDuplicates: duplicates.length,
     },
     instructions: instructionRows,
+    parentHarmSessions,
     gaps,
     crossSurfaceDuplicates: duplicates,
     reportOnlyGaps,
+    oversized: oversizedRestructureTargets(memoryFile, parentNonComplianceSessions, minGapEvidence),
   };
+}
+
+function parentSessionCounts(memoryFile, instructions, field) {
+  const counts = {};
+  for (const unit of memoryFile?.units || []) {
+    if (!unit.parts?.length) continue;
+    const sessions = new Set(instructions.get(unit.id)?.[field] || []);
+    for (const part of unit.parts) {
+      for (const session of instructions.get(part.id)?.[field] || []) sessions.add(session);
+    }
+    counts[unit.id] = sessions.size;
+  }
+  return counts;
+}
+
+/**
+ * An oversized paragraph whose sentence-parts drew repeated non-compliance. Synthesis
+ * should split that blob into list items, not slap a bold label on it.
+ */
+function oversizedRestructureTargets(memoryFile, nonComplianceSessions, minGapEvidence) {
+  if (!memoryFile) return [];
+  const targets = [];
+  for (const unit of memoryFile.units) {
+    if (!unit.parts?.length) continue;
+    const sessions = nonComplianceSessions[unit.id] || 0;
+    if (sessions < minGapEvidence) continue;
+    targets.push({
+      id: unit.id,
+      tokens: unit.tokens,
+      parts: unit.parts.map((part) => part.id),
+      sessions,
+    });
+  }
+  return targets;
 }
 
 /**
@@ -304,6 +350,23 @@ function failedTriggerOf(items, minGapEvidence) {
     : {};
 }
 
+function renderSkillOverlap(lines, overlap) {
+  const match =
+    `    CROSS-SURFACE: restates skill "${overlap.skill}" ${overlap.surface} ` +
+    `(similarity ${overlap.score.toFixed(2)})`;
+  if (overlap.surface === "description") {
+    lines.push(
+      `${match} - duplicated always-loaded tokens; ` +
+        `drop the memory-file copy, do not treat it as a second instruction`,
+    );
+  } else {
+    lines.push(
+      `${match} - triggered skill-body overlap (report-only); weigh relevance and trigger suitability, ` +
+        `do not infer the memory-file copy should be dropped`,
+    );
+  }
+}
+
 /** Compact rendering of the folded evidence for the synthesis prompt. */
 export function renderEvidenceForPrompt(summary) {
   return renderEvidence(summary, { includeReportOnly: false });
@@ -345,28 +408,51 @@ function renderEvidence(summary, { includeReportOnly }) {
       `- [${row.instruction}] +${row.positive} -${row.negative}${harm} sessions=${row.sessions} relevance=${relevance}${byCategory}${cost}` +
         (row.known ? "" : " (id not found in current file - stale reference)"),
     );
-    if (row.skillOverlap) {
-      const overlap = row.skillOverlap;
-      const match =
-        `    CROSS-SURFACE: restates skill "${overlap.skill}" ${overlap.surface} ` +
-        `(similarity ${overlap.score.toFixed(2)})`;
-      if (overlap.surface === "description") {
-        lines.push(
-          `${match} - duplicated always-loaded tokens; ` +
-            `drop the memory-file copy, do not treat it as a second instruction`,
-        );
-      } else {
-        lines.push(
-          `${match} - triggered skill-body overlap (report-only); weigh relevance and trigger suitability, ` +
-            `do not infer the memory-file copy should be dropped`,
-        );
-      }
-    }
+    if (row.skillOverlap) renderSkillOverlap(lines, row.skillOverlap);
     for (const quote of row.quotes.slice(0, 3)) {
       const sign = quote.polarity === "negative" ? "-" : "+";
       const cls = quote.polarity === "negative" ? ` [${quote.class ?? "unclassified"}]` : "";
       const effect = quote.effect ? ` :: ${oneLine(quote.effect, 200)}` : "";
       lines.push(`    ${sign}${cls} "${oneLine(quote.text)}"${effect} (${quote.source})`);
+    }
+  }
+
+  const representedOverlaps = new Set(
+    summary.instructions.filter((row) => row.skillOverlap).map((row) => row.instruction),
+  );
+  const parentOverlaps = (summary.crossSurfaceDuplicates || []).filter(
+    (overlap) => !representedOverlaps.has(overlap.instruction),
+  );
+  if (parentOverlaps.length) {
+    lines.push("");
+    lines.push("Parent paragraph cross-surface overlap:");
+    for (const overlap of parentOverlaps) {
+      lines.push(`- ${overlap.instruction} parent paragraph`);
+      renderSkillOverlap(lines, overlap);
+    }
+  }
+
+  const parentHarm = Object.entries(summary.parentHarmSessions || {}).filter(([, sessions]) => sessions > 0);
+  if (parentHarm.length) {
+    lines.push("");
+    lines.push("Parent paragraph removal evidence aggregated across sentence parts:");
+    for (const [id, sessions] of parentHarm) lines.push(`- ${id} harm-sessions=${sessions}`);
+  }
+
+  if (summary.oversized?.length) {
+    lines.push("");
+    lines.push("### Oversized units that failed to steer");
+    lines.push(
+      "These are one paragraph apiece. Preferred reinforcement is a restructure-in-place: split " +
+        "the paragraph into list items so each claim can be followed. A bold label on the blob is " +
+        "not a strengthen.",
+    );
+    for (const blob of summary.oversized) {
+      const parts = blob.parts.map((id) => `[${id}]`).join(", ");
+      lines.push(
+        `- ${blob.id} is ${blob.tokens} tokens as one paragraph (attribution: ${parts}). ` +
+          `Split it into list items; do not decorate the blob.`,
+      );
     }
   }
 
