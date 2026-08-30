@@ -123,9 +123,10 @@ export function recoveredLineCounts(texts) {
 
 /**
  * Split one pure-removal memory-file hunk at the boundary between text that lands in a
- * created skill and text that vanishes. Adjacent removals merge into one measured change
- * (`anchoredHunks`), so without this split an extraction and an unrelated deletion that
- * happen to sit next to each other in the file fuse into a single accept/reject decision.
+ * created or extended skill and text that vanishes. Adjacent removals merge into one
+ * measured change (`anchoredHunks`), so without this split an extraction and an unrelated
+ * deletion that happen to sit next to each other in the file fuse into a single
+ * accept/reject decision.
  * The boundary is a decision boundary, and it falls on instruction-unit edges because a
  * skill carries whole sections.
  *
@@ -247,12 +248,20 @@ export function measureWorkspace(workspace) {
     changes.push({ kind: "created", file: relative, text, skill: parseSkillFile(relative, text) });
   }
 
-  // With the created files known, split any memory-file removal that mixes extracted
-  // text (recovered in a created file) with deleted text, so the deletion is its own
+  // Split any memory-file removal that mixes extracted text (recovered in a created
+  // skill or in a modified existing one) with deleted text, so the deletion is its own
   // measured change and stays independently decidable.
   const createdTexts = changes.filter((c) => c.kind === "created").map((c) => c.text);
-  if (createdTexts.length) {
-    const recovered = recoveredLineCounts(createdTexts);
+  const extendedSkillFiles = [
+    ...new Set(
+      changes
+        .filter((c) => c.kind === "hunk" && c.file !== memoryPath && isSkillFilePath(c.file, skillDirs))
+        .map((c) => c.file),
+    ),
+  ];
+  const recoveredTexts = [...createdTexts, ...extendedSkillFiles.map((file) => texts.get(file) ?? "")];
+  if (recoveredTexts.length) {
+    const recovered = recoveredLineCounts(recoveredTexts);
     const oldText = originals.get(memoryPath) ?? "";
     const oldLines = oldText.split("\n");
     const measured = [];

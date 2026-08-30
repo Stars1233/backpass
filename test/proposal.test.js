@@ -17,6 +17,7 @@ import { estimateTokens } from "../src/tokens.js";
 import { isSuppressedByRejection, recordRejection, State } from "../src/state.js";
 import { applyDecisions } from "../src/apply/writer.js";
 import { injectPayload, parseDecisions, renderApplySurface } from "../src/apply/lavish.js";
+import { renderEdit } from "../src/apply/terminal.js";
 import { extractJson, parseTokenLine, stripAcpxNoise } from "../src/acpx.js";
 import { makeRepo, stageAndMeasure, writeIn } from "./helpers/staging.js";
 
@@ -364,7 +365,7 @@ test("an extract is the created SKILL.md file(s) grouped with the memory change 
     edit: extractEdit,
     annotation: { edits: [claim(["H1"], { kind: "extract", title: "x" }), claim(["H2"], { kind: "add", title: "y" })] },
   });
-  assert.ok(split.violations.some((v) => /kind "extract" must group created SKILL\.md file\(s\)/.test(v)));
+  assert.ok(split.violations.some((v) => /kind "extract" must group SKILL\.md file\(s\)/.test(v)));
   assert.ok(split.violations.some((v) => /only kind "extract" may include a created file \(H2\)/.test(v)));
 
   const headless = gate({
@@ -430,6 +431,288 @@ test("skills whose removals were measured as one change may share an extract; se
     `expected a split demand, got ${JSON.stringify(separate.violations)}`,
   );
   assert.ok(separate.violations.some((v) => /give each skill its own extract/.test(v)));
+});
+
+const noHarmRows = () => ({
+  analyzedSessions: 4,
+  totals: { positive: 0, negative: 4, gapClusters: 0 },
+  instructions: Array.from({ length: 20 }, (_, i) => ({
+    instruction: `AG-${String(i + 1).padStart(3, "0")}`,
+    positive: 0,
+    negative: 4,
+    harmSessions: 0,
+    sessions: 4,
+    relevance: 1,
+    quotes: [],
+  })),
+});
+
+test("an extract may extend an existing SKILL.md when the staged file keeps prior lines and carries the removal", () => {
+  const existing = skillFile("node-setup", "- Prefer nvm over a system node.\n");
+  const extracted = "- Use Node 18 via nvm before running any script.";
+  const extend = (root) => {
+    writeIn(root, "AGENTS.md", (t) => t.replace(extracted, "- See the node-setup skill."));
+    writeIn(root, ".agents/skills/node-setup/SKILL.md", (t) =>
+      t.replace("- Prefer nvm over a system node.\n", `- Prefer nvm over a system node.\n${extracted}\n`),
+    );
+  };
+  const files = { ".agents/skills/node-setup/SKILL.md": existing };
+
+  const good = gate({
+    files,
+    edit: extend,
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "fold the node pin into node-setup" })] },
+    context: { summary: noHarmRows() },
+  });
+  assert.deepEqual(good.violations, [], good.violations.join("\n"));
+  assert.equal(good.proposal.edits.length, 1);
+  assert.equal(good.proposal.edits[0].kind, "extract");
+  assert.equal(good.proposal.edits[0].hunks.length, 2, "memory removal and skill extension are one decision");
+  assert.equal(
+    good.proposal.edits[0].skills.length,
+    0,
+    "the skill already exists; apply patches it, it does not create it",
+  );
+  assert.equal(good.proposal.stats.skillExtractions, 1);
+  assert.deepEqual(
+    good.proposal.targetFiles.map((t) => t.file),
+    [".agents/skills/node-setup/SKILL.md"],
+  );
+
+  const mixed = gate({
+    files,
+    edit: (root) => {
+      extend(root);
+      writeIn(root, ".agents/skills/release-signing/SKILL.md", skillFile("release-signing"));
+    },
+    annotation: {
+      edits: [claim(["H1", "H2", "H3"], { kind: "extract", title: "extend setup and add signing" })],
+    },
+    context: { summary: noHarmRows() },
+  });
+  assert.deepEqual(mixed.violations, [], mixed.violations.join("\n"));
+  assert.equal(mixed.proposal.stats.skillExtractions, 2, "created and extended destinations both count");
+
+  const applied = applyDecisions({
+    proposal: good.proposal,
+    decisions: { e1: "accepted" },
+    repo: good.repo,
+    state: good.state,
+    config: { budgetTokens: 5000 },
+  });
+  assert.equal(applied.failed.length, 0, JSON.stringify(applied.failed));
+  const skill = fs.readFileSync(path.join(good.repo.root, ".agents/skills/node-setup/SKILL.md"), "utf8");
+  assert.ok(skill.includes("- Prefer nvm over a system node."), "prior skill lines stay");
+  assert.ok(skill.includes(extracted), "extracted lines land in the existing skill");
+  const memory = fs.readFileSync(path.join(good.repo.root, "AGENTS.md"), "utf8");
+  assert.ok(memory.includes("- See the node-setup skill."));
+  assert.ok(!memory.includes(extracted));
+
+  const split = gate({
+    files,
+    edit: extend,
+    annotation: { edits: [claim(["H1", "H2"], { kind: "rewrite", title: "fold the node pin into node-setup" })] },
+    context: { summary: noHarmRows() },
+  });
+  assert.ok(
+    split.violations.some((v) => /an edit changes one file/.test(v)),
+    `grouping the two files as a rewrite must fail, got ${JSON.stringify(split.violations)}`,
+  );
+
+  const cut = (root) => {
+    writeIn(root, "AGENTS.md", (t) => t.replace(`${extracted}\n`, ""));
+    writeIn(root, ".agents/skills/node-setup/SKILL.md", (t) =>
+      t.replace("- Prefer nvm over a system node.\n", `- Prefer nvm over a system node.\n${extracted}\n`),
+    );
+  };
+  const asRemove = gate({
+    files,
+    edit: cut,
+    annotation: {
+      edits: [
+        claim(["H1"], { kind: "remove", title: "drop the node pin" }),
+        claim(["H2"], { kind: "rewrite", title: "append to node-setup" }),
+      ],
+    },
+    context: { summary: noHarmRows() },
+  });
+  assert.ok(
+    asRemove.violations.some((v) => /harm-class negative evidence/.test(v)),
+    `a bare memory deletion still needs harm, got ${JSON.stringify(asRemove.violations)}`,
+  );
+  const asExtract = gate({
+    files,
+    edit: cut,
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "fold the node pin into node-setup" })] },
+    context: { summary: noHarmRows() },
+  });
+  assert.deepEqual(asExtract.violations, [], asExtract.violations.join("\n"));
+
+  const droppedPrior = gate({
+    files,
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (t) => t.replace(extracted, "- See the node-setup skill."));
+      writeIn(root, ".agents/skills/node-setup/SKILL.md", skillFile("node-setup", `${extracted}\n`));
+    },
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "replace the skill body" })] },
+    context: { summary: noHarmRows() },
+  });
+  assert.ok(
+    droppedPrior.violations.some((v) => /drops text the existing skill already had/.test(v)),
+    droppedPrior.violations.join("\n"),
+  );
+});
+
+test("an extended extraction requires prior skill lines plus separately carried memory lines", () => {
+  const extracted = "- Use Node 18 via nvm before running any script.";
+  const skill = skillFile("node-setup", `${extracted}\n`);
+  const reusedPriorCopy = gate({
+    files: { ".agents/skills/node-setup/SKILL.md": skill },
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (text) => text.replace(extracted, "- See the node-setup skill."));
+      writeIn(root, ".agents/skills/node-setup/SKILL.md", (text) => `${text}- Added unrelated guidance.\n`);
+    },
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "extract node setup" })] },
+  });
+
+  assert.ok(
+    reusedPriorCopy.violations.some((violation) => /removes text its skill\(s\) do not carry/.test(violation)),
+    reusedPriorCopy.violations.join("\n"),
+  );
+});
+
+test("an extract cannot bypass addition evidence without removing memory text", () => {
+  const skill = skillFile("node-setup", "- Keep this setup guidance.\n");
+  const files = { ".agents/skills/node-setup/SKILL.md": skill };
+  const addOnly = (root) => {
+    writeIn(root, "AGENTS.md", (text) => `${text}- Unsupported new memory rule.\n`);
+    writeIn(root, ".agents/skills/node-setup/SKILL.md", (text) => `${text}- More skill guidance.\n`);
+  };
+
+  const unsupported = gate({
+    files,
+    edit: addOnly,
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "add setup guidance", transcripts: 1 })] },
+  });
+  assert.ok(
+    unsupported.violations.some((violation) => /adds a new instruction backed by 1 session/.test(violation)),
+    unsupported.violations.join("\n"),
+  );
+
+  const corroborated = gate({
+    files,
+    edit: addOnly,
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "add setup guidance" })] },
+  });
+  assert.ok(
+    corroborated.violations.some((violation) => /kind "extract" must remove text/.test(violation)),
+    corroborated.violations.join("\n"),
+  );
+});
+
+test("a move repositions verbatim memory-file text without the harm floor", () => {
+  const text = `${MEMORY_TEXT}\n## Later\n\n- Keep this nearby.\n`;
+  const node = "- Use Node 18 via nvm before running any script.";
+  const relocate = memoryEdit((t) =>
+    t.replace(`${node}\n`, "").replace("- Keep this nearby.", `- Keep this nearby.\n${node}`),
+  );
+
+  const split = gate({
+    text,
+    edit: relocate,
+    annotation: {
+      edits: [
+        claim(["H1"], { kind: "remove", title: "drop the node pin" }),
+        claim(["H2"], { kind: "add", title: "put it later" }),
+      ],
+    },
+    context: { summary: noHarmRows() },
+  });
+  assert.ok(
+    split.violations.some((v) => /harm-class negative evidence/.test(v)),
+    `the deletion half of a move must hit the harm floor, got ${JSON.stringify(split.violations)}`,
+  );
+
+  const moved = gate({
+    text,
+    edit: relocate,
+    annotation: { edits: [claim(["H1", "H2"], { kind: "move", title: "park the node pin later" })] },
+    context: { summary: noHarmRows() },
+  });
+  assert.deepEqual(moved.violations, [], moved.violations.join("\n"));
+  assert.equal(moved.proposal.edits.length, 1);
+  assert.equal(moved.proposal.edits[0].kind, "move");
+  assert.equal(moved.proposal.edits[0].hunks.length, 2, "deletion and re-add are one decision");
+
+  const applied = applyDecisions({
+    proposal: moved.proposal,
+    decisions: { e1: "accepted" },
+    repo: moved.repo,
+    state: moved.state,
+    config: { budgetTokens: 5000 },
+  });
+  assert.equal(applied.failed.length, 0, JSON.stringify(applied.failed));
+  const next = fs.readFileSync(path.join(moved.repo.root, "AGENTS.md"), "utf8");
+  const first = next.indexOf(node);
+  assert.ok(first !== -1);
+  assert.equal(next.indexOf(node, first + 1), -1, "the line appears once, not duplicated");
+  assert.ok(first > next.indexOf("## Later"), "the line moved below Later");
+
+  const fake = gate({
+    text,
+    edit: memoryEdit((t) =>
+      t.replace(`${node}\n`, "").replace("- Keep this nearby.", "- Keep this nearby.\n- Use Node 22 instead."),
+    ),
+    annotation: { edits: [claim(["H1", "H2"], { kind: "move", title: "rewrite disguised as move" })] },
+    context: { summary: noHarmRows() },
+  });
+  assert.ok(
+    fake.violations.some((v) => /does not reappear verbatim/.test(v)),
+    fake.violations.join("\n"),
+  );
+
+  const extraAddition = gate({
+    text,
+    edit: memoryEdit((t) =>
+      t
+        .replace(`${node}\n`, "")
+        .replace("- Keep this nearby.", `- Keep this nearby.\n${node}\n- Unsupported extra rule.`),
+    ),
+    annotation: { edits: [claim(["H1", "H2"], { kind: "move", title: "move and smuggle an addition" })] },
+    context: { summary: noHarmRows() },
+  });
+  assert.ok(
+    extraAddition.violations.some((v) => /removed and added lines must match exactly/.test(v)),
+    extraAddition.violations.join("\n"),
+  );
+
+  const duplicateText = [
+    MEMORY_TEXT,
+    "## Middle",
+    "",
+    node,
+    "",
+    "## Spacer",
+    "",
+    "- Leave enough unique context between copies.",
+    "",
+    "## Destination",
+    "",
+    "- Keep this last.",
+    "",
+  ].join("\n");
+  const doubleRemoval = gate({
+    text: duplicateText,
+    edit: memoryEdit((t) => t.replaceAll(`${node}\n`, "").replace("- Keep this last.", `- Keep this last.\n${node}`)),
+    annotation: {
+      edits: [claim(["H1", "H2", "H3"], { kind: "move", title: "collapse two copies into one" })],
+    },
+    context: { summary: noHarmRows() },
+  });
+  assert.ok(
+    doubleRemoval.violations.some((v) => /removed and added lines must match exactly/.test(v)),
+    doubleRemoval.violations.join("\n"),
+  );
 });
 
 test("a skill's description can be rewritten in place; deletions and stray files are refused or ignored", () => {
@@ -500,6 +783,43 @@ test("a previously rejected edit is suppressed until new evidence arrives", () =
     context: { rejections, isSuppressed: isSuppressedByRejection },
   });
   assert.equal(revived.proposal.edits.length, 1, "materially new evidence revives the edit");
+});
+
+test("rejection suppression distinguishes multi-file extraction destinations", () => {
+  const sharedSkill = skillFile("setup", "- Keep the existing setup step.\n");
+  const files = {
+    ".agents/skills/setup-a/SKILL.md": sharedSkill,
+    ".agents/skills/setup-b/SKILL.md": sharedSkill,
+  };
+  const extracted = "- Use Node 18 via nvm before running any script.";
+  const extractTo = (destination) => (root) => {
+    writeIn(root, "AGENTS.md", (text) => text.replace(extracted, "- See the setup skill."));
+    writeIn(root, destination, (text) => `${text}${extracted}\n`);
+  };
+  const annotation = {
+    edits: [claim(["H1", "H2"], { kind: "extract", title: "extract setup" })],
+  };
+
+  const first = gate({ files, edit: extractTo(".agents/skills/setup-a/SKILL.md"), annotation });
+  assert.deepEqual(first.violations, [], first.violations.join("\n"));
+  const rejections = recordRejection(first.proposal.edits[0], { version: 1, entries: {} });
+
+  const sameDestination = gate({
+    files,
+    edit: extractTo(".agents/skills/setup-a/SKILL.md"),
+    annotation,
+    context: { rejections, isSuppressed: isSuppressedByRejection },
+  });
+  assert.equal(sameDestination.proposal.edits.length, 0);
+
+  const otherDestination = gate({
+    files,
+    edit: extractTo(".agents/skills/setup-b/SKILL.md"),
+    annotation,
+    context: { rejections, isSuppressed: isSuppressedByRejection },
+  });
+  assert.deepEqual(otherDestination.violations, [], otherDestination.violations.join("\n"));
+  assert.equal(otherDestination.proposal.edits.length, 1, "a different destination is a materially different edit");
 });
 
 test("projectWithDecisions tracks the budget for the subset the human accepted", () => {
@@ -1076,10 +1396,14 @@ test("the apply surface separates memory, description, and on-trigger deltas", (
         targetsMemoryFile: true,
         deltaTokens: -20,
         descriptionDelta: 5,
-        hunks: [],
-        skills: [
-          { name: "setup", path: ".agents/skills/setup/SKILL.md", description: "Load for setup.", body: "body" },
+        hunks: [
+          { file: "AGENTS.md", lines: [{ type: "del", text: "- setup details" }] },
+          {
+            file: ".agents/skills/setup/SKILL.md",
+            lines: [{ type: "ins", text: "- setup details" }],
+          },
         ],
+        skills: [],
         evidence: [],
       },
       {
@@ -1107,9 +1431,42 @@ test("the apply surface separates memory, description, and on-trigger deltas", (
   const cards = nodes.get("edits").children;
   assert.match(textOf(cards[0]), /Δ memory -20 tok/);
   assert.match(textOf(cards[0]), /Δ description \(always-loaded\) \+5 tok/);
+  assert.match(textOf(cards[0]), /files: AGENTS\.md, \.agents\/skills\/setup\/SKILL\.md/);
+  const fileBoundaries = (function collect(node) {
+    return [node, ...node.children.flatMap(collect)];
+  })(cards[0])
+    .filter((node) => node.className === "file")
+    .map((node) => node.textContent);
+  assert.deepEqual(fileBoundaries, ["--- AGENTS.md ---", "--- .agents/skills/setup/SKILL.md ---"]);
   assert.match(textOf(cards[1]), /Δ on trigger -1 tok/);
   assert.match(textOf(cards[1]), /Δ description \(always-loaded\) -2 tok/);
+  assert.match(textOf(cards[1]), /file: \.agents\/skills\/db\/SKILL\.md/);
   assert.equal(nodes.get("gauge-title").textContent, "Always-loaded budget · AGENTS.md + skill descriptions");
+});
+
+test("terminal review labels every file in a multi-file extraction", () => {
+  const output = renderEdit(
+    {
+      kind: "extract",
+      title: "extract setup",
+      file: "AGENTS.md",
+      targetsMemoryFile: true,
+      hunks: [
+        { file: "AGENTS.md", lines: [{ type: "del", text: "- setup details" }] },
+        {
+          file: ".agents/skills/setup/SKILL.md",
+          lines: [{ type: "ins", text: "- setup details" }],
+        },
+      ],
+      skills: [],
+    },
+    0,
+    1,
+  );
+
+  assert.match(output, /files: AGENTS\.md, \.agents\/skills\/setup\/SKILL\.md/);
+  assert.match(output, /--- AGENTS\.md ---/);
+  assert.match(output, /--- \.agents\/skills\/setup\/SKILL\.md ---/);
 });
 
 test("the decision vector from the review surface is parsed back into decisions", () => {
@@ -1484,9 +1841,7 @@ test("an extract cannot smuggle the adjacent deletion: its skills must carry eve
     context: { summary: betaRows({ harmSessions: 0 }) },
   });
   assert.ok(
-    violations.some(
-      (v) => /removes text its created skill\(s\) do not carry/.test(v) && /separate "remove" edit/.test(v),
-    ),
+    violations.some((v) => /removes text its skill\(s\) do not carry/.test(v) && /separate "remove" edit/.test(v)),
     violations.join("\n"),
   );
 });
