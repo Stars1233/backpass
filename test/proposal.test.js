@@ -13,6 +13,7 @@ import {
   SHRINK_EDIT_TOKENS,
   SHRINK_MAX_EDITS,
 } from "../src/proposal.js";
+import { foldEvidence, renderEvidenceForPrompt, renderEvidenceReport } from "../src/fold.js";
 import { estimateTokens } from "../src/tokens.js";
 import { isSuppressedByRejection, recordRejection, State } from "../src/state.js";
 import { applyDecisions } from "../src/apply/writer.js";
@@ -213,6 +214,71 @@ test("an edit spanning several single-newline list items lands: find is measured
 
 // ---------- evidence gates ----------
 
+test("folded domain votes separate synthesis evidence from report-only diagnostics", () => {
+  const phrasing = "Read docs/sshhip.md before changing the tunnel.";
+  const folded = (domains, minGapEvidence) =>
+    foldEvidence(
+      domains.map((domain, index) => ({
+        status: "ok",
+        transcript: {
+          id: `s${index + 1}`,
+          harness: "claude",
+          startedAt: Date.parse("2026-08-01T00:00:00Z"),
+        },
+        positive: [],
+        negative: [],
+        gaps: [
+          {
+            proposedInstruction: phrasing,
+            mistake: `mistake ${index + 1}`,
+            quote: `quote ${index + 1}`,
+            recurrenceRisk: "high",
+            domain,
+          },
+        ],
+      })),
+      { minGapEvidence },
+    );
+  const propose = (summary, minGapEvidence) => {
+    const displayed = summary.gaps[0] || summary.reportOnlyGaps[0];
+    const evidence = displayed.quotes.slice(0, 1).map((quote) => ({
+      polarity: "negative",
+      text: quote.text,
+      source: quote.source,
+    }));
+    return gate({
+      edit: memoryEdit((text) => `${text}- ${phrasing}\n`),
+      annotation: {
+        edits: [
+          claim(["H1"], {
+            kind: "add",
+            evidence,
+            transcripts: Math.max(displayed.sessions, minGapEvidence),
+          }),
+        ],
+      },
+      config: config({ minGapEvidence }),
+      context: { summary },
+    });
+  };
+
+  const eligible = propose(folded(["project", "orchestration"], 2), 2);
+  assert.equal(eligible.violations.length, 0);
+  assert.equal(eligible.proposal.edits.length, 1);
+
+  for (const summary of [
+    folded(["orchestration", "orchestration", "project"], 2),
+    folded(["project", "orchestration"], 3),
+  ]) {
+    const prompt = renderEvidenceForPrompt(summary);
+    assert.doesNotMatch(prompt, /Read docs\/sshhip\.md|quote [123]|REPORT ONLY/);
+    const report = renderEvidenceReport(summary);
+    assert.match(report, /REPORT ONLY - not synthesis-eligible evidence/);
+    assert.match(report, /Read docs\/sshhip\.md/);
+    assert.doesNotMatch(report, /quote [123]/);
+  }
+});
+
 test("the per-run edit cap is enforced - it is the learning rate", () => {
   const lines = Array.from({ length: 6 }, (_, i) => `- Rule number ${i}.`);
   const text = `# T\n\n${lines.join("\n")}\n`;
@@ -296,6 +362,7 @@ test("the proposal carries the fold's gap-funnel counts for the apply surface", 
           negative: 7,
           gapSightings: 9,
           gapClusters: 0,
+          reportOnlyGapClusters: 2,
           droppedGapSingletons: 3,
           orchestrationGapSightings: 6,
         },
@@ -308,6 +375,7 @@ test("the proposal carries the fold's gap-funnel counts for the apply surface", 
   });
   assert.equal(funneled.proposal.stats.gapSightings, 9);
   assert.equal(funneled.proposal.stats.orchestrationGapSightings, 6);
+  assert.equal(funneled.proposal.stats.reportOnlyGapClusters, 2);
   assert.equal(funneled.proposal.stats.droppedGapSingletons, 3);
   assert.equal(funneled.proposal.stats.gapClusters, 0);
 
@@ -315,6 +383,7 @@ test("the proposal carries the fold's gap-funnel counts for the apply surface", 
   const legacy = gate({ edit, annotation });
   assert.equal(legacy.proposal.stats.gapSightings, null);
   assert.equal(legacy.proposal.stats.orchestrationGapSightings, null);
+  assert.equal(legacy.proposal.stats.reportOnlyGapClusters, null);
   assert.equal(legacy.proposal.stats.droppedGapSingletons, null);
 });
 

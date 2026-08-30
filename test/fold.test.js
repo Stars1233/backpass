@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { foldEvidence, renderEvidenceForPrompt } from "../src/fold.js";
+import { foldEvidence, renderEvidenceForPrompt, renderEvidenceReport } from "../src/fold.js";
 import { parseMemoryUnits } from "../src/memory.js";
 
 function record(id, overrides = {}) {
@@ -130,7 +130,126 @@ test("the fold records the sightings it clustered over - the gap funnel's top", 
   assert.equal(fromLedger.totals.gapSightings, 4);
   assert.equal(fromLedger.totals.orchestrationGapSightings, 1);
   assert.equal(fromLedger.totals.gapClusters, 1, "two sessions corroborate the lockfile gap");
-  assert.equal(fromLedger.totals.droppedGapSingletons, 1, "the schema gap stays below the floor");
+  assert.equal(
+    fromLedger.totals.droppedGapSingletons,
+    2,
+    "the schema and pure-orchestration gaps stay below the floor",
+  );
+});
+
+test("a two-sighting cluster with one orchestration vote survives instead of dropping below the floor", () => {
+  const phrasing = "Read docs/sshhip.md before changing the tunnel.";
+  const summary = foldEvidence(
+    [
+      record("s1", {
+        gaps: [{ proposedInstruction: phrasing, quote: "rewrote the tunnel", recurrenceRisk: "high" }],
+      }),
+      record("s2", {
+        gaps: [
+          {
+            proposedInstruction: phrasing,
+            quote: "rewrote the tunnel again",
+            recurrenceRisk: "high",
+            domain: "orchestration",
+          },
+        ],
+      }),
+    ],
+    { minGapEvidence: 2 },
+  );
+
+  assert.equal(summary.gaps.length, 1, "one inconsistent orchestration vote cannot kill a two-session recurrence");
+  assert.equal(summary.gaps[0].sessions, 2);
+  assert.equal(summary.gaps[0].orchestrationSightings, 1);
+  assert.equal(summary.gaps[0].mixed, true);
+  assert.equal(summary.gaps[0].majorityOrchestration, false);
+  assert.equal(summary.totals.orchestrationGapSightings, 1);
+  assert.equal(summary.totals.droppedGapSingletons, 0);
+  assert.match(renderEvidenceForPrompt(summary), /2 sightings, 1 orchestration/);
+
+  const majorityOrch = foldEvidence(
+    [
+      record("s1", {
+        gaps: [{ proposedInstruction: phrasing, quote: "q1", recurrenceRisk: "low", domain: "orchestration" }],
+      }),
+      record("s2", {
+        gaps: [{ proposedInstruction: phrasing, quote: "q2", recurrenceRisk: "low", domain: "orchestration" }],
+      }),
+      record("s3", {
+        gaps: [{ proposedInstruction: phrasing, quote: "q3", recurrenceRisk: "low" }],
+      }),
+    ],
+    { minGapEvidence: 2 },
+  );
+  assert.equal(
+    majorityOrch.gaps.length,
+    0,
+    "a majority orchestration vote still withholds the cluster from a proposal",
+  );
+  assert.equal(majorityOrch.reportOnlyGaps.length, 1);
+  assert.equal(majorityOrch.reportOnlyGaps[0].sessions, 3);
+  assert.equal(majorityOrch.totals.reportOnlyGapClusters, 1);
+  const renderedMajority = renderEvidenceReport(majorityOrch);
+  assert.match(renderedMajority, /1 gap clusters \(0 synthesis eligible, 1 report only/);
+  assert.match(renderedMajority, /3 sightings, 2 orchestration; domain excluded by majority vote/);
+  assert.match(renderedMajority, /no gap cluster is eligible for a repository proposal/);
+  assert.doesNotMatch(renderedMajority, /none above the evidence threshold/);
+  assert.doesNotMatch(renderEvidenceForPrompt(majorityOrch), /Read docs\/sshhip\.md|REPORT ONLY/);
+});
+
+test("a below-threshold mixed cluster remains visible only in the report", () => {
+  const phrasing = "Read docs/sshhip.md before changing the tunnel.";
+  const summary = foldEvidence(
+    [
+      record("s1", {
+        gaps: [{ proposedInstruction: phrasing, quote: "q1", recurrenceRisk: "high" }],
+      }),
+      record("s2", {
+        gaps: [
+          {
+            proposedInstruction: phrasing,
+            quote: "q2",
+            recurrenceRisk: "high",
+            domain: "orchestration",
+          },
+        ],
+      }),
+    ],
+    { minGapEvidence: 3 },
+  );
+
+  assert.equal(summary.gaps.length, 0);
+  assert.equal(summary.reportOnlyGaps.length, 1);
+  assert.equal(summary.totals.reportOnlyGapClusters, 1);
+  assert.equal(summary.totals.droppedGapSingletons, 0);
+  assert.match(renderEvidenceReport(summary), /2 sightings, 1 orchestration/);
+  assert.match(renderEvidenceReport(summary), /Read docs\/sshhip\.md/);
+  assert.doesNotMatch(renderEvidenceForPrompt(summary), /Read docs\/sshhip\.md|REPORT ONLY/);
+});
+
+test("a pure orchestration singleton stays hidden below the evidence floor", () => {
+  const phrasing = "Stop after the report on scout tasks.";
+  const summary = foldEvidence(
+    [
+      record("s1", {
+        gaps: [
+          {
+            proposedInstruction: phrasing,
+            quote: "q1",
+            recurrenceRisk: "low",
+            domain: "orchestration",
+          },
+        ],
+      }),
+    ],
+    { minGapEvidence: 2 },
+  );
+
+  assert.equal(summary.gaps.length, 0);
+  assert.equal(summary.reportOnlyGaps.length, 0);
+  assert.equal(summary.totals.reportOnlyGapClusters, 0);
+  assert.equal(summary.totals.droppedGapSingletons, 1);
+  assert.doesNotMatch(renderEvidenceForPrompt(summary), /Stop after the report/);
 });
 
 test("the same gap repeated inside one session does not clear the threshold", () => {

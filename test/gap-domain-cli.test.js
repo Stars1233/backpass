@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { State } from "../src/state.js";
 import { resolveMemoryFiles } from "../src/memory.js";
 import { foldForRun } from "../src/commands/propose.js";
-import { renderEvidenceForPrompt } from "../src/fold.js";
+import { renderEvidenceForPrompt, renderEvidenceReport } from "../src/fold.js";
 
 /**
  * A gap's `domain` decides whether it can ever become an instruction, so this drives the
@@ -18,9 +18,9 @@ import { renderEvidenceForPrompt } from "../src/fold.js";
  * the analysis prompt actually handed to the model states the causal test for
  * `orchestration` (the mistake was caused by the harness around the session, not by this
  * repository - except when this repository IS that tool, in which case those mistakes
- * are `project`), and the mechanics behind it are unchanged - orchestration sightings are
- * recorded and counted but never corroborate, while a gap with no domain at all is still
- * treated as `project`.
+ * are `project`), and the mechanics behind it: orchestration sightings are recorded as
+ * votes and a cluster is withheld from a proposal only on a majority vote, while a gap
+ * with no domain at all is still treated as `project`.
  */
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -224,9 +224,11 @@ test("an orchestration gap is counted but never corroborates, while a gap with n
     "only the domain-less gap - counted as project - can reach a proposal",
   );
 
-  const rendered = renderEvidenceForPrompt(summary);
-  assert.ok(!rendered.includes(ORCHESTRATION_GAP), "the orchestration gap never reaches the synthesis prompt");
-  assert.match(rendered, /2 orchestration-domain sighting\(s\).*excluded/, "the run stays legible about what it cut");
+  const prompt = renderEvidenceForPrompt(summary);
+  assert.ok(!prompt.includes(ORCHESTRATION_GAP), "the orchestration gap never reaches synthesis");
+  const report = renderEvidenceReport(summary);
+  assert.ok(report.includes(ORCHESTRATION_GAP), "the orchestration gap remains visible as report-only");
+  assert.match(report, /2 orchestration-domain sighting\(s\).*excluded/, "the run stays legible about what it cut");
 
   const ledger = state.readGapLedger();
   const domains = Object.values(ledger.entries).map((entry) => Object.values(entry.sessions)[0].domain);

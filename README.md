@@ -214,7 +214,9 @@ units that substantially overlap a project skill. An overlap with a skill descri
 always-loaded tokens and points the shrink at the memory-file copy; an overlap with a
 triggered skill body is placement evidence only, since the memory copy may be the only
 always-loaded coverage. Neither kind is deleted automatically. Duplicate gaps across
-sessions are clustered, and clusters seen in fewer than `minGapEvidence` sessions (default 2) are dropped. One bad session never rewrites the weights.
+sessions are clustered, and only clusters seen in at least `minGapEvidence` sessions
+(default 2) are eligible for synthesis. Mixed-domain clusters below that floor remain
+visible as report-only diagnostics. One bad session never rewrites the weights.
 
 Whether two sightings are one gap is a judgment call, not a word-overlap score - models
 paraphrase, and a paraphrase that fails a lexical match would hide real recurrence.
@@ -223,10 +225,13 @@ it sees a gap already on the books, and, when at least two open entries exist, o
 consolidation call sees the full open gap set and merges entries that describe the same
 mistake. That second judgment is what lets two sightings of a brand-new gap in the same
 run's parallel fan-out corroborate. A failed consolidation call degrades the run to
-lexical identity and says so; it never aborts. Orchestration-domain gaps are counted and
-reported but never cluster: a mistake caused not by this repository but by the external
-agent harness or tooling that orchestrated a session does not become an instruction in the
-project's memory file.
+lexical identity and says so; it never aborts. All sightings cluster before their domain
+is decided. Each sighting votes `project` or `orchestration`; only a majority-orchestration
+cluster is excluded from synthesis, while a tie stays eligible. Mixed clusters are always
+reported with their orchestration count, even below the evidence floor. A corroborated
+majority-excluded cluster, including a pure-orchestration cluster, remains clearly labeled
+as a report-only diagnostic rather than becoming an instruction in the project's memory
+file; an uncorroborated pure-orchestration singleton stays hidden.
 
 Only evidence judged against the _current_ memory-surface hash, stamped with one of the two
 interaction categories, and belonging to this run's selected sample is folded into a
@@ -367,9 +372,8 @@ changed since the proposal measured it, exactly as it refuses a drifted memory f
 `backpass apply` is the only command that writes. It serves a review surface through
 [`lavish-axi`](https://github.com/kunchenguid/lavish-axi): one card per edit with the diff,
 the evidence quotes and their sources, a live budget gauge, and ACCEPT / REJECT. A compact
-gap funnel shows how accumulated sightings narrowed through domain filtering, clustering,
-and the corroboration floor to the gaps eligible for a proposal; older proposals without
-recorded funnel counts omit it.
+gap funnel summarizes recorded gap evidence and proposal eligibility; older proposals
+without recorded funnel counts omit it.
 
 The surface is a static template shipped in the package - the CLI injects one JSON payload,
 so it is instant, deterministic, and identical every run. Nothing there is model-generated.

@@ -7,7 +7,7 @@ import path from "node:path";
 import { State } from "../src/state.js";
 import { parseMemoryUnits } from "../src/memory.js";
 import { foldForRun } from "../src/commands/propose.js";
-import { foldEvidence, renderEvidenceForPrompt } from "../src/fold.js";
+import { foldEvidence, renderEvidenceForPrompt, renderEvidenceReport } from "../src/fold.js";
 import {
   gapEntryId,
   ledgerGapObservations,
@@ -252,8 +252,15 @@ test("orchestration-domain gaps are counted but never cluster into a proposal", 
   const summary = await run(h, [record("claude-s1", [orchestration]), record("codex-s2", [orchestration])]);
 
   assert.equal(summary.gaps.length, 0, "two sessions corroborate it, and it still never becomes a proposal");
+  assert.equal(summary.reportOnlyGaps.length, 1);
+  assert.equal(summary.totals.reportOnlyGapClusters, 1);
   assert.equal(summary.totals.orchestrationGapSightings, 2, "but the run stays legible about what it excluded");
-  assert.match(renderEvidenceForPrompt(summary), /2 orchestration-domain sighting\(s\).*excluded/);
+  const prompt = renderEvidenceForPrompt(summary);
+  assert.doesNotMatch(prompt, /Stop after the report on scout tasks/);
+  const report = renderEvidenceReport(summary);
+  assert.match(report, /1 gap clusters \(0 synthesis eligible, 1 report only/);
+  assert.match(report, /2 orchestration-domain sighting\(s\).*excluded/);
+  assert.match(report, /2 sightings, 2 orchestration; domain excluded by majority vote/);
 
   // The same shape in the project domain clusters as usual - the exclusion is the
   // domain, not the text.
@@ -261,6 +268,20 @@ test("orchestration-domain gaps are counted but never cluster into a proposal", 
   const project = { proposedInstruction: "Stop after the report on scout tasks.", domain: "project" };
   const clustered = await run(control, [record("claude-s1", [project]), record("codex-s2", [project])]);
   assert.equal(clustered.gaps.length, 1);
+});
+
+test("a mixed two-sighting cluster with one orchestration vote still graduates", async () => {
+  const h = harness();
+  const phrasing = "Read docs/sshhip.md before changing the tunnel.";
+  const summary = await run(h, [
+    record("claude-s1", [{ proposedInstruction: phrasing, domain: "project" }]),
+    record("codex-s2", [{ proposedInstruction: phrasing, domain: "orchestration" }]),
+  ]);
+
+  assert.equal(summary.gaps.length, 1, "the cluster is not silently dropped below the two-session floor");
+  assert.equal(summary.gaps[0].sessions, 2);
+  assert.equal(summary.gaps[0].orchestrationSightings, 1);
+  assert.match(renderEvidenceForPrompt(summary), /2 sightings, 1 orchestration/);
 });
 
 // ---------- consolidation-pass merges (the mechanical half) ----------
@@ -295,6 +316,30 @@ test("mergeGapEntries unions sessions without double-counting and keeps the shor
   assert.equal(entries.length, 1);
   assert.equal(entries[0].proposedInstruction, "The short phrasing.");
   assert.deepEqual(Object.keys(entries[0].sessions).sort(), ["s1", "s2", "shared"], "a session never counts twice");
+});
+
+test("mergeGapEntries reconciles conflicting domain votes without target-order bias", () => {
+  const orchestrationId = "a".repeat(16);
+  const projectId = "b".repeat(16);
+  const phrasing = "Read docs/sshhip.md before changing the tunnel.";
+  const ledger = ledgerWith(
+    { id: orchestrationId, text: `${phrasing} Carefully.`, sessions: ["orch-only", "shared"] },
+    { id: projectId, text: phrasing, sessions: ["project-only", "shared"] },
+  );
+  ledger.entries[orchestrationId].sessions["orch-only"].domain = "orchestration";
+  ledger.entries[orchestrationId].sessions.shared.domain = "orchestration";
+  ledger.entries[projectId].sessions["project-only"].domain = "project";
+  ledger.entries[projectId].sessions.shared.domain = "project";
+
+  mergeGapEntries(ledger, [[orchestrationId, projectId]]);
+  const summary = foldEvidence([], {
+    gapObservations: ledgerGapObservations(ledger, MEMORY_PATH),
+    minGapEvidence: 2,
+  });
+
+  assert.equal(summary.gaps.length, 1, "the chosen merge target cannot turn a conflicting vote into orchestration");
+  assert.equal(summary.gaps[0].sessions, 3);
+  assert.equal(summary.gaps[0].orchestrationSightings, 1);
 });
 
 test("mergeGapEntries preserves absorbed citations for duplicate sessions", () => {
