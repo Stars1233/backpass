@@ -11,7 +11,7 @@ import {
 } from "../src/agents.js";
 import { AcpxError, acpxAgentName, classifyAcpxFailure, effortOptionKey, probeSession } from "../src/acpx.js";
 import { DEFAULT_LADDERS, loadConfig } from "../src/config.js";
-import { UserError, setQuiet } from "../src/logger.js";
+import { UserError, setLoggerSink, setQuiet } from "../src/logger.js";
 
 setQuiet(true);
 
@@ -56,6 +56,7 @@ function scriptedProbe(verdicts) {
  * @param {Record<string, any>} verdicts
  * @param {{ config?: any, state?: ReturnType<typeof memoryState>, now?: () => number,
  *   bypassCache?: boolean, acpxVersion?: () => Promise<string | null>,
+ *   providerAuthState?: (agent: string) => string,
  *   sleep?: (ms: number) => Promise<void> }} [options]
  */
 function resolverWith(
@@ -153,6 +154,34 @@ test("the resolved model id is the adapter's spelling, never the bare id", async
   assert.equal(pick.agent, "pi");
   assert.equal(pick.model, "openai-codex/gpt-5.6-luna");
   assert.equal(pick.ladderModel, "gpt-5.6-luna");
+});
+
+test("the real ladder keeps Pi when its ambiguous model has a subscription winner", async () => {
+  const config = loadConfig(tmpRepo());
+  config.ladders.analysis = [{ model: "gpt-5.6-luna", agents: ["pi", "codex"] }];
+  const calls = [];
+  const resolver = new AgentResolver(config, {
+    state: memoryState(),
+    acpxVersion: async () => "0.13.0",
+    probeCandidate: (candidate, options) => {
+      calls.push(candidate.agent);
+      return probeCandidate(candidate, {
+        ...options,
+        providerAuthTypes: { openai: "api_key", "openai-codex": "subscription" },
+        probeSession: async () => ({
+          verdict: "ok",
+          detail: "",
+          availableModels:
+            candidate.agent === "pi" ? ["openai/gpt-5.6-luna", "openai-codex/gpt-5.6-luna"] : ["gpt-5.6-luna"],
+        }),
+      });
+    },
+  });
+
+  const pick = await resolver.resolve("analysis");
+  assert.equal(pick.agent, "pi");
+  assert.equal(pick.model, "openai-codex/gpt-5.6-luna");
+  assert.deepEqual(calls, ["pi"]);
 });
 
 test("claude is decided by `claude auth status`, not by the acpx session probe", async () => {
@@ -310,11 +339,13 @@ test("non-claude candidates resolve the bare id against the advertised list", as
 });
 
 test("AUTH_REQUIRED mid-run falls through to the next candidate", async () => {
-  const { resolver, calls, state } = resolverWith({
+  const authState = () => "auth-a";
+  const verdicts = {
     "pi|gpt-5.6-luna": { resolvedModel: "openai-codex/gpt-5.6-luna" },
     "opencode|gpt-5.6-luna": "model-unavailable",
     "codex|gpt-5.6-luna": { resolvedModel: "gpt-5.6-luna" },
-  });
+  };
+  const { resolver, calls, state } = resolverWith(verdicts, { providerAuthState: authState });
 
   const attempts = [];
   const result = await resolver.withFallthrough("analysis", async (pick) => {
@@ -327,7 +358,12 @@ test("AUTH_REQUIRED mid-run falls through to the next candidate", async () => {
   assert.deepEqual(attempts, ["pi/openai-codex/gpt-5.6-luna", "codex/gpt-5.6-luna"]);
   assert.deepEqual(calls, ["pi|gpt-5.6-luna", "opencode|gpt-5.6-luna", "codex|gpt-5.6-luna"]);
   assert.equal(state.cache.entries["pi|gpt-5.6-luna"].verdict, "unauthenticated", "the failure is remembered");
+  assert.equal(state.cache.entries["pi|gpt-5.6-luna"].authState, "auth-a");
   assert.equal((await resolver.resolve("analysis")).agent, "codex", "later calls in the run stay on the fallback");
+
+  const replay = resolverWith(verdicts, { state, providerAuthState: authState });
+  assert.equal((await replay.resolver.resolve("analysis")).agent, "codex");
+  assert.deepEqual(replay.calls, [], "the demotion remains cached while auth state is unchanged");
 });
 
 test("parallel workers failing on the same candidate fall through once, together", async () => {
@@ -404,7 +440,36 @@ test("explicit config or CLI flags pin the role and skip the ladder entirely", a
   assert.equal(opencodeSynthesis.effort, "xhigh");
   assert.deepEqual(opencodeCalls, [], "pinned OpenCode skips the ladder");
 
-  assert.deepEqual(calls, [], "nothing was probed");
+  assert.deepEqual(calls, [], "pins without a bare resolvable id are not probed");
+
+  const bareConfig = loadConfig(tmpRepo({ analysis: { agent: "pi", model: "gpt-5.6-luna" } }));
+  const { resolver: bareResolver, calls: bareCalls } = resolverWith(
+    { "pi|gpt-5.6-luna": { resolvedModel: "openai-codex/gpt-5.6-luna" } },
+    { config: bareConfig },
+  );
+  const barePick = await bareResolver.resolve("analysis");
+  assert.equal(barePick.model, "openai-codex/gpt-5.6-luna");
+  assert.equal(barePick.pinned, true);
+  assert.deepEqual(bareCalls, ["pi|gpt-5.6-luna"]);
+
+  const { resolver: refusedPinned } = resolverWith(
+    {
+      "pi|gpt-5.6-luna": {
+        verdict: "model-unavailable",
+        detail:
+          "ambiguous among advertised ids: openai/gpt-5.6-luna, other/gpt-5.6-luna (disambiguate with a provider-qualified id)",
+      },
+    },
+    { config: bareConfig },
+  );
+  await assert.rejects(
+    () => refusedPinned.resolve("analysis"),
+    (err) =>
+      err instanceof UserError &&
+      /openai\/gpt-5\.6-luna/.test(err.message) &&
+      /other\/gpt-5\.6-luna/.test(err.message) &&
+      /provider-qualified/.test(err.hint),
+  );
 
   // A pinned agent is the user's decision: an auth failure surfaces as a UserError, it does not fall through.
   await assert.rejects(
@@ -492,42 +557,42 @@ test("a missing acpx is reported once, not once per candidate", async () => {
 test("probe verdicts are cached with TTLs and invalidated on an acpx version change", async () => {
   let now = Date.parse("2026-08-22T00:00:00Z");
   const state = memoryState();
+  const config = loadConfig(tmpRepo());
+  config.ladders.analysis = [{ model: "gpt-5.6-luna", agents: ["codex", "grok"] }];
   const verdicts = {
-    "pi|gpt-5.6-luna": "unauthenticated",
-    "opencode|gpt-5.6-luna": { resolvedModel: "openai/gpt-5.6-luna" },
+    "codex|gpt-5.6-luna": "unauthenticated",
+    "grok|gpt-5.6-luna": { resolvedModel: "gpt-5.6-luna" },
   };
 
-  const first = resolverWith(verdicts, { state, now: () => now });
-  assert.equal((await first.resolver.resolve("analysis")).agent, "opencode");
+  const first = resolverWith(verdicts, { config, state, now: () => now });
+  assert.equal((await first.resolver.resolve("analysis")).agent, "grok");
   assert.equal(first.calls.length, 2);
 
-  // 10 minutes later: both verdicts are fresh, nothing is probed.
   now += 10 * 60 * 1000;
-  const second = resolverWith(verdicts, { state, now: () => now });
-  assert.equal((await second.resolver.resolve("analysis")).agent, "opencode");
+  const second = resolverWith(verdicts, { config, state, now: () => now });
+  assert.equal((await second.resolver.resolve("analysis")).agent, "grok");
   assert.deepEqual(second.calls, []);
 
-  // 45 minutes later: the negative expired (30min) and is re-probed; the ok (12h) is not.
   now += 35 * 60 * 1000;
   const third = resolverWith(
-    { ...verdicts, "pi|gpt-5.6-luna": { resolvedModel: "openai-codex/gpt-5.6-luna" } },
-    {
-      state,
-      now: () => now,
-    },
+    { ...verdicts, "codex|gpt-5.6-luna": { resolvedModel: "gpt-5.6-luna" } },
+    { config, state, now: () => now },
   );
-  assert.equal((await third.resolver.resolve("analysis")).agent, "pi", "logging in is picked up within 30min");
-  assert.deepEqual(third.calls, ["pi|gpt-5.6-luna"]);
+  assert.equal((await third.resolver.resolve("analysis")).agent, "codex", "logging in is picked up within 30min");
+  assert.deepEqual(third.calls, ["codex|gpt-5.6-luna"]);
 
-  // --force bypasses the cache.
-  const forced = resolverWith(verdicts, { state, now: () => now, bypassCache: true });
+  const forced = resolverWith(verdicts, { config, state, now: () => now, bypassCache: true });
   await forced.resolver.resolve("analysis");
   assert.ok(forced.calls.length >= 1);
 
-  // A new acpx drops every entry.
-  const upgraded = resolverWith(verdicts, { state, now: () => now, acpxVersion: async () => "0.14.0" });
+  const upgraded = resolverWith(verdicts, {
+    config,
+    state,
+    now: () => now,
+    acpxVersion: async () => "0.14.0",
+  });
   await upgraded.resolver.resolve("analysis");
-  assert.deepEqual(upgraded.calls, ["pi|gpt-5.6-luna", "opencode|gpt-5.6-luna"]);
+  assert.deepEqual(upgraded.calls, ["codex|gpt-5.6-luna", "grok|gpt-5.6-luna"]);
   assert.equal(state.cache.acpxVersion, "0.14.0");
 
   assert.equal(isProbeEntryFresh(null), false);
@@ -549,6 +614,37 @@ test("probe verdicts are cached with TTLs and invalidated on an acpx version cha
     false,
     "a legacy native timeout is never treated as a durable negative",
   );
+});
+
+test("provider-auth-sensitive cache entries are reused only while auth state matches", async () => {
+  const now = Date.parse("2026-08-22T00:00:00Z");
+  const state = memoryState({
+    version: 1,
+    acpxVersion: "0.13.0",
+    entries: {
+      "pi|gpt-5.6-luna": {
+        verdict: "ok",
+        detail: "",
+        resolvedModel: "openai/gpt-5.6-luna",
+        checkedAt: new Date(now).toISOString(),
+        authState: "auth-a",
+      },
+    },
+  });
+  const unchanged = resolverWith(
+    { "pi|gpt-5.6-luna": { resolvedModel: "openai-codex/gpt-5.6-luna" } },
+    { state, now: () => now + 60_000, providerAuthState: () => "auth-a" },
+  );
+  assert.equal((await unchanged.resolver.resolve("analysis")).model, "openai/gpt-5.6-luna");
+  assert.deepEqual(unchanged.calls, []);
+
+  const changed = resolverWith(
+    { "pi|gpt-5.6-luna": { resolvedModel: "openai-codex/gpt-5.6-luna" } },
+    { state, now: () => now + 60_000, providerAuthState: () => "auth-b" },
+  );
+  assert.equal((await changed.resolver.resolve("analysis")).model, "openai-codex/gpt-5.6-luna");
+  assert.deepEqual(changed.calls, ["pi|gpt-5.6-luna"]);
+  assert.equal(state.cache.entries["pi|gpt-5.6-luna"].authState, "auth-b");
 });
 
 test("a transient probe timeout retries once and does not poison the cache", async () => {
@@ -655,6 +751,209 @@ test("bare model ids resolve by segment equality, never by prefix", () => {
   const ambiguous = resolveModelId("grok-4.6", ["xai/grok-4.6", "other/grok-4.6"]);
   assert.equal(ambiguous.id, null);
   assert.deepEqual(ambiguous.ambiguous, ["xai/grok-4.6", "other/grok-4.6"]);
+
+  const nested = resolveModelId("vendor/x", ["openrouter/vendor/x", "direct/vendor/x"], {
+    providerAuthTypes: { openrouter: "subscription", direct: "api_key" },
+  });
+  assert.equal(nested.id, "openrouter/vendor/x");
+  assert.deepEqual(nested.tieBreak, {
+    preferred: "openrouter/vendor/x",
+    over: ["direct/vendor/x"],
+  });
+});
+
+test("pi openai vs openai-codex gpt-5.6-luna prefers the subscription provider", () => {
+  // Regression: with OPENAI_API_KEY set, Pi advertises the same bare id under the
+  // API-key provider and the ChatGPT-subscription provider. Refusing the collision
+  // used to skip pi as "model not advertised" and silently reroute the ladder.
+  const advertised = ["openai/gpt-5.6-luna", "openai-codex/gpt-5.6-luna"];
+  const resolved = resolveModelId("gpt-5.6-luna", advertised, {
+    providerAuthTypes: { openai: "api_key", "openai-codex": "subscription" },
+  });
+  assert.equal(resolved.id, "openai-codex/gpt-5.6-luna");
+  if (!("tieBreak" in resolved)) throw new Error("expected a tie-break");
+  assert.deepEqual(resolved.tieBreak, {
+    preferred: "openai-codex/gpt-5.6-luna",
+    over: ["openai/gpt-5.6-luna"],
+  });
+});
+
+test("each advertised-list shape ranks a subscription+API-key pair and refuses the unrankable rest", async () => {
+  /** @type {Array<{
+   *   agent: string,
+   *   bare: string,
+   *   advertised: string[],
+   *   types: Record<string, "subscription" | "api_key">,
+   *   prefer: string,
+   *   unique: string[],
+   *   uniqueId: string,
+   * }>} */
+  const shapes = [
+    {
+      agent: "pi",
+      bare: "gpt-5.6-luna",
+      advertised: ["openai/gpt-5.6-luna", "openai-codex/gpt-5.6-luna"],
+      types: { openai: "api_key", "openai-codex": "subscription" },
+      prefer: "openai-codex/gpt-5.6-luna",
+      unique: ["kimi-coding/k3", "openai-codex/gpt-5.6-luna"],
+      uniqueId: "openai-codex/gpt-5.6-luna",
+    },
+    {
+      agent: "opencode",
+      bare: "gpt-5.6-luna",
+      advertised: ["openai/gpt-5.6-luna", "anthropic/gpt-5.6-luna"],
+      types: { openai: "subscription", anthropic: "api_key" },
+      prefer: "openai/gpt-5.6-luna",
+      unique: ["opencode/free", "openai/gpt-5.6-luna", "openai/gpt-5.6-luna-fast"],
+      uniqueId: "openai/gpt-5.6-luna",
+    },
+    {
+      agent: "codex",
+      bare: "gpt-5.6-luna",
+      advertised: ["openai/gpt-5.6-luna", "azure/gpt-5.6-luna"],
+      types: { openai: "subscription", azure: "api_key" },
+      prefer: "openai/gpt-5.6-luna",
+      unique: ["gpt-5.6-luna", "gpt-5.5"],
+      uniqueId: "gpt-5.6-luna",
+    },
+    {
+      agent: "grok",
+      bare: "grok-4.6",
+      advertised: ["xai/grok-4.6", "openrouter/grok-4.6"],
+      types: { xai: "subscription", openrouter: "api_key" },
+      prefer: "xai/grok-4.6",
+      unique: ["grok-4.6", "grok-4.5"],
+      uniqueId: "grok-4.6",
+    },
+    {
+      agent: "cursor",
+      bare: "gpt-5.6-luna",
+      advertised: ["openai/gpt-5.6-luna", "azure/gpt-5.6-luna"],
+      types: { openai: "subscription", azure: "api_key" },
+      prefer: "openai/gpt-5.6-luna",
+      unique: ["gpt-5.6-luna[context=272k,reasoning=medium,fast=false]", "gpt-5.5[fast=false]"],
+      uniqueId: "gpt-5.6-luna[context=272k,reasoning=medium,fast=false]",
+    },
+  ];
+
+  for (const shape of shapes) {
+    const ranked = resolveModelId(shape.bare, shape.advertised, { providerAuthTypes: shape.types });
+    assert.equal(ranked.id, shape.prefer, `${shape.agent} subscription+api_key`);
+    const refused = resolveModelId(shape.bare, shape.advertised, { providerAuthTypes: {} });
+    assert.equal(refused.id, null, `${shape.agent} unrankable`);
+    assert.deepEqual(refused.ambiguous, shape.advertised);
+    assert.equal(resolveModelId(shape.bare, shape.unique).id, shape.uniqueId, `${shape.agent} unique`);
+  }
+
+  const claude = await probeCandidate(
+    { agent: "claude", model: "claude-sonnet-5" },
+    {
+      sessionName: "t",
+      runCapture: async () => ({ code: 0, stdout: '{"loggedIn": true}\n', stderr: "" }),
+      probeSession: async () => ({ verdict: "ok", detail: "", availableModels: ["default", "sonnet"] }),
+    },
+  );
+  assert.equal(claude.resolvedModel, "claude-sonnet-5", "claude still forwards any id");
+
+  const piProbe = await probeCandidate(
+    { agent: "pi", model: "gpt-5.6-luna" },
+    {
+      sessionName: "t",
+      probeSession: async () => ({
+        verdict: "ok",
+        detail: "",
+        availableModels: ["openai/gpt-5.6-luna", "openai-codex/gpt-5.6-luna"],
+      }),
+      providerAuthTypes: { openai: "api_key", "openai-codex": "subscription" },
+    },
+  );
+  assert.equal(piProbe.verdict, "ok");
+  assert.equal(piProbe.resolvedModel, "openai-codex/gpt-5.6-luna");
+  assert.match(piProbe.detail, /preferred subscription provider openai-codex\/gpt-5.6-luna over openai\/gpt-5.6-luna/);
+
+  const loud = await probeCandidate(
+    { agent: "pi", model: "gpt-5.6-luna" },
+    {
+      sessionName: "t",
+      probeSession: async () => ({
+        verdict: "ok",
+        detail: "",
+        availableModels: ["openai/gpt-5.6-luna", "other/gpt-5.6-luna"],
+      }),
+      providerAuthTypes: {},
+    },
+  );
+  assert.equal(loud.verdict, "model-unavailable");
+  assert.match(loud.detail, /openai\/gpt-5.6-luna/);
+  assert.match(loud.detail, /other\/gpt-5.6-luna/);
+  assert.match(loud.detail, /provider-qualified/);
+});
+
+test("a winning subscription tie-break is visible on the probe trail", async () => {
+  const lines = [];
+  setQuiet(false);
+  setLoggerSink((line) => lines.push(String(line)));
+  try {
+    const { resolver } = resolverWith({
+      "pi|gpt-5.6-luna": {
+        resolvedModel: "openai-codex/gpt-5.6-luna",
+        tieBreak: { preferred: "openai-codex/gpt-5.6-luna", over: ["openai/gpt-5.6-luna"] },
+      },
+    });
+    await resolver.resolve("analysis");
+    assert.ok(
+      lines.some((line) =>
+        /preferred subscription provider openai-codex\/gpt-5.6-luna over openai\/gpt-5.6-luna/.test(line),
+      ),
+    );
+  } finally {
+    setLoggerSink(null);
+    setQuiet(true);
+  }
+});
+
+test("opencode's native models probe ranks a subscription collision instead of skipping", async () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-fake-opencode-"));
+  fs.writeFileSync(
+    path.join(bin, "opencode"),
+    `#!/bin/sh\necho 'openai/gpt-5.6-luna'\necho 'anthropic/gpt-5.6-luna'\n`,
+  );
+  fs.chmodSync(path.join(bin, "opencode"), 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${oldPath}`;
+  try {
+    const ok = await probeCandidate(
+      { agent: "opencode", model: "gpt-5.6-luna" },
+      {
+        sessionName: "t",
+        providerAuthTypes: { openai: "subscription", anthropic: "api_key" },
+        probeSession: async () => ({
+          verdict: "ok",
+          detail: "",
+          availableModels: ["openai/gpt-5.6-luna", "anthropic/gpt-5.6-luna"],
+        }),
+      },
+    );
+    assert.equal(ok.verdict, "ok");
+    assert.equal(ok.resolvedModel, "openai/gpt-5.6-luna");
+
+    const refused = await probeCandidate(
+      { agent: "opencode", model: "gpt-5.6-luna" },
+      {
+        sessionName: "t",
+        providerAuthTypes: {},
+        probeSession: async () => {
+          throw new Error("acpx probe must not run when native models are unrankably ambiguous");
+        },
+      },
+    );
+    assert.equal(refused.verdict, "model-unavailable");
+    assert.match(refused.detail, /openai\/gpt-5.6-luna/);
+    assert.match(refused.detail, /anthropic\/gpt-5.6-luna/);
+    assert.match(refused.detail, /provider-qualified/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
 });
 
 test("acpx failure classification and the per-adapter tables", () => {
