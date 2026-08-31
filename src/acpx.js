@@ -60,11 +60,29 @@ export class AcpxError extends Error {
 }
 
 /**
+ * Every acpx call goes through here, which is also where a Windows command-shim
+ * refusal (`src/subprocess.js`) is raised. It has to be raised at the funnel rather
+ * than at each caller: a refusal resolves as `{ code: null, spawnError }`, which every
+ * result inspection downstream would read as a generic failure - `openSession` would
+ * call it "no session support" and the per-turn prompt "exit null", neither naming the
+ * argument backpass refused to pass. Widening `classifyAcpxFailure` is wrong for a
+ * related reason: `unreachable` would silently demote the harness and the next
+ * candidate would fail on the very same argument.
+ *
  * @param {string[]} args
  * @param {{ timeoutMs?: number, cwd?: string, input?: string, env?: NodeJS.ProcessEnv }} [options]
  */
-function run(args, options = {}) {
-  return runCapture(ACPX_BIN, args, options);
+async function run(args, options = {}) {
+  const result = await runCapture(ACPX_BIN, args, options);
+  const spawnError = result.spawnError;
+  if (spawnError?.code === "ERR_WINDOWS_SHIM_UNSAFE_ARG") {
+    const value = spawnError.value === undefined ? "" : JSON.stringify(String(spawnError.value));
+    throw new UserError(
+      `backpass refused to pass ${value} to ${ACPX_BIN} through the Windows command interpreter`,
+      spawnError.message,
+    );
+  }
+  return result;
 }
 
 function notFoundError(result) {
@@ -351,23 +369,25 @@ export async function openSession({ agent, model = null, effort = null, sessionN
   const notes = [...invocation.notes];
   const acpxAgentArgs = invocationAgentArgs(invocation, agent);
   const runOpts = { timeoutMs: 60_000, cwd, env: invocation.env };
+  /** @type {Awaited<ReturnType<typeof run>>} */
+  let created;
   try {
     await verifyHarnessInvocation(invocation, cwd);
+    created = await run(
+      [
+        ...(invocation.acpxModel ? ["--model", invocation.acpxModel] : []),
+        ...acpxAgentArgs,
+        "sessions",
+        "new",
+        "--name",
+        sessionName,
+      ],
+      runOpts,
+    );
   } catch (err) {
     invocation.dispose();
     throw err;
   }
-  const created = await run(
-    [
-      ...(invocation.acpxModel ? ["--model", invocation.acpxModel] : []),
-      ...acpxAgentArgs,
-      "sessions",
-      "new",
-      "--name",
-      sessionName,
-    ],
-    runOpts,
-  );
   if (created.spawnError && created.spawnError.code === "ENOENT") {
     invocation.dispose();
     throw notFoundError(created);
@@ -394,13 +414,16 @@ export async function openSession({ agent, model = null, effort = null, sessionN
   const close = async () => {
     if (closed) return;
     closed = true;
-    const result = await run([...acpxAgentArgs, "sessions", "close", sessionName], {
-      timeoutMs: 30_000,
-      cwd,
-      env: invocation.env,
-    });
-    if (result.code !== 0) warn(`could not close acpx session ${sessionName}`);
-    invocation.dispose();
+    try {
+      const result = await run([...acpxAgentArgs, "sessions", "close", sessionName], {
+        timeoutMs: 30_000,
+        cwd,
+        env: invocation.env,
+      });
+      if (result.code !== 0) warn(`could not close acpx session ${sessionName}`);
+    } finally {
+      invocation.dispose();
+    }
   };
 
   try {

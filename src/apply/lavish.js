@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { UserError, color, info, warn } from "../logger.js";
+import { windowsShimLaunch } from "../subprocess.js";
 
 /**
  * The apply surface (captain decision 4).
@@ -45,7 +46,17 @@ export function renderApplySurface(proposal, state, toolVersion) {
 
 function runLavish(args, { inherit = false } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(LAVISH_BIN, args, { stdio: inherit ? "inherit" : ["ignore", "pipe", "pipe"] });
+    // `lavish-axi` is an npm bin, so on Windows it is a `.cmd` shim that CreateProcess
+    // cannot start: same spawn policy as `runCapture` (issue #43).
+    const launch = windowsShimLaunch(LAVISH_BIN, args);
+    if (launch.error) {
+      resolve({ code: null, stdout: "", stderr: launch.error.message, spawnError: launch.error });
+      return;
+    }
+    const child = spawn(launch.file, launch.args, {
+      stdio: inherit ? "inherit" : ["ignore", "pipe", "pipe"],
+      ...(launch.verbatim ? { windowsVerbatimArguments: true } : {}),
+    });
     let stdout = "";
     let stderr = "";
     if (!inherit) {
@@ -87,6 +98,9 @@ export async function openApplySurface(file) {
   // `--reopen` it exits 0 and prints the dead session's URL - which apply would then hand
   // the reviewer as if it were live. On a live or agent-ended session the flag is a no-op.
   const result = await runLavish([file, "--reopen", "--no-open"]);
+  if (result.spawnError && result.spawnError.code === "ERR_WINDOWS_SHIM_UNSAFE_ARG") {
+    throw new UserError(result.spawnError.message);
+  }
   if (result.spawnError && result.spawnError.code === "ENOENT") {
     throw new UserError(
       `${LAVISH_BIN} not found on PATH`,
