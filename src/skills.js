@@ -111,22 +111,68 @@ export function skillDescriptionTokens(skills) {
   return (skills || []).reduce((sum, s) => sum + (s.descriptionTokens ?? estimateTokens(s.description || "")), 0);
 }
 
-/** Minimal YAML frontmatter reader: only `key: value` and folded multi-line values. */
+/** Minimal YAML frontmatter reader for plain values and `>` / `|` multi-line values. */
 export function parseFrontmatter(text) {
   const match = /^---\n([\s\S]*?)\n---/.exec(text);
   if (!match) return {};
   const result = {};
   let currentKey = null;
+  let block = null;
+
+  const finishBlock = () => {
+    if (!block) return;
+    const lines = block.lines;
+    let value;
+    if (block.style === "|") {
+      value = lines.length ? `${lines.join("\n")}\n` : "";
+    } else {
+      value = foldBlockLines(lines);
+    }
+    if (block.chomp === "-") value = value.replace(/\n+$/, "");
+    if (block.chomp === "") value = value.replace(/\n*$/, lines.some(Boolean) ? "\n" : "");
+    result[block.key] = value;
+    block = null;
+  };
+
   for (const line of match[1].split("\n")) {
     const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
     if (kv) {
+      finishBlock();
       currentKey = kv[1];
-      result[currentKey] = kv[2].trim().replace(/^["']|["']$/g, "");
-    } else if (currentKey && /^\s+\S/.test(line)) {
+      const rawValue = kv[2].trim();
+      const blockIndicator = /^([>|])([+-]?)$/.exec(rawValue);
+      if (blockIndicator) {
+        result[currentKey] = "";
+        block = { key: currentKey, style: blockIndicator[1], chomp: blockIndicator[2], indent: null, lines: [] };
+      } else {
+        result[currentKey] = rawValue.replace(/^["']|["']$/g, "");
+      }
+    } else if (block && /^\s*$/.test(line)) {
+      block.lines.push("");
+    } else if (block && /^\s+\S/.test(line)) {
+      if (block.indent === null) block.indent = /^\s+/.exec(line)[0].length;
+      block.lines.push(line.slice(block.indent));
+    } else if (currentKey && !block && /^\s+\S/.test(line)) {
       result[currentKey] = `${result[currentKey]} ${line.trim()}`.trim();
     }
   }
+  finishBlock();
   return result;
+}
+
+function foldBlockLines(lines) {
+  let value = "";
+  let previousContent = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i] === "") continue;
+    if (previousContent < 0) value += "\n".repeat(i);
+    else value += i === previousContent + 1 ? " " : "\n".repeat(i - previousContent - 1);
+    value += lines[i];
+    previousContent = i;
+  }
+  if (previousContent >= 0) value += "\n".repeat(lines.length - previousContent);
+  else value = "\n".repeat(lines.length);
+  return value;
 }
 
 export function renderSkillIndex(skills) {
