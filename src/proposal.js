@@ -113,6 +113,7 @@ function normalizeEdit(raw, index) {
     instructions: Array.isArray(raw?.instructions) ? raw.instructions.map(String) : [],
     evidence: normalizeEvidence(raw?.evidence),
     transcripts: Number.isFinite(raw?.transcripts) ? Number(raw.transcripts) : countSources(raw?.evidence),
+    projects: Number.isFinite(raw?.projects) ? Number(raw.projects) : undefined,
   };
 }
 
@@ -271,7 +272,7 @@ export function renderChangesForPrompt(measured, memoryFile) {
   };
   return measured.changes
     .map((change) => {
-      const head = `[${describeChange(change)}${unitsAt(change)}]`;
+      const head = `[${describeChange({ ...change, file: change.workspaceFile || change.file })}${unitsAt(change)}]`;
       if (change.kind === "deleted") return head;
       if (change.kind === "created") {
         return `${head}\n${renderHunkLines(
@@ -292,6 +293,16 @@ export function renderChangesForPrompt(measured, memoryFile) {
  * the model's annotation. Nothing textual is taken from the model: the hunks, their
  * deltas, the projected budget, and even whether an edit is an addition are measured.
  */
+function countedEvidenceProjects(edit, summary) {
+  const quoted = new Set(edit.evidence.map((item) => `${item.source || ""}\n${item.text || ""}`));
+  return Math.max(
+    0,
+    ...(summary?.gaps || [])
+      .filter((gap) => gap.quotes?.some((quote) => quoted.has(`${quote.source || ""}\n${quote.text || ""}`)))
+      .map((gap) => gap.projects || 0),
+  );
+}
+
 export function buildProposal(rawResult, context) {
   const {
     memoryFile,
@@ -303,6 +314,7 @@ export function buildProposal(rawResult, context) {
     rejections = { entries: {} },
     isSuppressed = () => false,
     skillFiles = [],
+    scope = null,
   } = context;
 
   const violations = [];
@@ -502,10 +514,19 @@ export function buildProposal(rawResult, context) {
 
     // An addition is measured, not declared: text that only goes in is a new instruction.
     const onlyAdds = hunks.every((h) => h.removed === 0);
+    const projectGate = scope?.kind === "user" && config.minGapProjects != null;
+    const evidenceProjects = onlyAdds && projectGate ? countedEvidenceProjects(edit, summary) : null;
     if (!preservesAlwaysLoaded(edit.kind) && onlyAdds && edit.transcripts < config.minGapEvidence) {
       violations.push(
         `edit ${edit.id} ("${edit.title}") adds a new instruction backed by ${edit.transcripts} session(s); ` +
           `${config.minGapEvidence} are required`,
+      );
+      continue;
+    }
+    if (!preservesAlwaysLoaded(edit.kind) && onlyAdds && projectGate && evidenceProjects < config.minGapProjects) {
+      violations.push(
+        `edit ${edit.id} ("${edit.title}") adds a new instruction backed by evidence from ${evidenceProjects} project(s); ` +
+          `${config.minGapProjects} are required`,
       );
       continue;
     }
@@ -569,6 +590,7 @@ export function buildProposal(rawResult, context) {
       instructions: edit.instructions,
       evidence: edit.evidence,
       transcripts: edit.transcripts,
+      ...(evidenceProjects != null ? { projects: evidenceProjects } : {}),
       skills: created.map((c) => c.skill),
       hunks: hunks.map((h) => ({
         id: h.id,
@@ -582,6 +604,9 @@ export function buildProposal(rawResult, context) {
         lines: h.lines,
       })),
       targetsMemoryFile: file === memoryFile.path,
+      applicable: true,
+      deltaTokens: 0,
+      descriptionDelta: 0,
     };
 
     if (isSuppressed(proposed, rejections)) {
@@ -690,6 +715,7 @@ export function buildProposal(rawResult, context) {
     tool: "backpass",
     generatedAt: new Date().toISOString(),
     repo: { name: repo.name, root: repo.root },
+    scope: scope?.kind || "project",
     memoryFile: { path: memoryFile.path, hash: memoryFile.hash, tokens: memoryFile.tokens },
     targetFiles,
     budget,
@@ -697,8 +723,9 @@ export function buildProposal(rawResult, context) {
       budgetTokens: config.budgetTokens,
       maxEditsPerRun: maxEdits,
       minGapEvidence: config.minGapEvidence,
+      ...(config.minGapProjects != null ? { minGapProjects: config.minGapProjects } : {}),
       skillsDir: config.skillsDir,
-      skillDirs: config.skillDirs,
+      skillsDirs: config.skillsDirs,
       analysis: config.analysis,
       synthesis: config.synthesis,
     },

@@ -37,6 +37,11 @@ evidence-backed edits to `AGENTS.md` / `CLAUDE.md` under a token budget.
 
 ## Sharp edges
 
+- **User-scope runs are a separate triple.** See README's User-level memory section
+  for user-facing paths and defaults. Association, filters, and the synthetic homedir
+  repo live in `src/scope.js`; user state never enters `<repo>/.backpass/`.
+  `minGapProjects` defaults to 1 (the gate exists; cross-project corroboration is not
+  required). A project-scoped run never writes a user-level file.
 - **Sibling clones are a live-path tier, not a recorded-remote one.** `git worktree
 list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches the
   parent of each worktree (and `discovery.cloneRoots`) for other checkouts that share a
