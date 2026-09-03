@@ -1,4 +1,5 @@
 import { renderHunkLines } from "./diff.js";
+import { normalizeSourceLabel } from "./gap-ledger.js";
 import { mixFromCounts } from "./interaction.js";
 import { memoryTextHash } from "./memory.js";
 import { editSkills, parseFrontmatter, skillDescriptionTokens } from "./skills.js";
@@ -104,6 +105,11 @@ export class ProposalViolation extends Error {
 function normalizeEdit(raw, index) {
   const kind = String(raw?.kind || "").toLowerCase();
   const refs = Array.isArray(raw?.changes) ? raw.changes : Array.isArray(raw?.hunks) ? raw.hunks : [];
+  const normalizedEvidence = normalizeEvidence(raw?.evidence);
+  const evidence = normalizedEvidence.map((item) => ({
+    ...item,
+    source: item.source.trim() || "unknown source",
+  }));
   return {
     id: `e${index + 1}`,
     kind,
@@ -111,9 +117,10 @@ function normalizeEdit(raw, index) {
     title: String(raw?.title || "").trim() || "(untitled edit)",
     rationale: String(raw?.rationale || "").trim(),
     instructions: Array.isArray(raw?.instructions) ? raw.instructions.map(String) : [],
-    evidence: normalizeEvidence(raw?.evidence),
-    transcripts: Number.isFinite(raw?.transcripts) ? Number(raw.transcripts) : countSources(raw?.evidence),
-    projects: Number.isFinite(raw?.projects) ? Number(raw.projects) : undefined,
+    evidence,
+    // Corroboration is measured from the edit's normalized quotes, never from a
+    // model-reported count.
+    transcripts: countSources(normalizedEvidence),
   };
 }
 
@@ -124,13 +131,13 @@ function normalizeEvidence(evidence) {
     .map((e) => ({
       polarity: e.polarity === "positive" ? "positive" : e.polarity === "neutral" ? "neutral" : "negative",
       text: String(e.text).trim().slice(0, 600),
-      source: String(e.source || "unknown source").slice(0, 120),
+      source: String(e.source || "").slice(0, 120),
     }));
 }
 
 function countSources(evidence) {
   if (!Array.isArray(evidence)) return 0;
-  return new Set(evidence.map((e) => e?.source).filter(Boolean)).size;
+  return new Set(evidence.map((e) => normalizeSourceLabel(e?.source)).filter(Boolean)).size;
 }
 
 /** The del-line texts of a hunk that are not carried by `lineCounts` (blank lines ignored). */
@@ -295,12 +302,19 @@ export function renderChangesForPrompt(measured, memoryFile) {
  */
 function countedEvidenceProjects(edit, summary) {
   const quoted = new Set(edit.evidence.map((item) => `${item.source || ""}\n${item.text || ""}`));
-  return Math.max(
-    0,
-    ...(summary?.gaps || [])
-      .filter((gap) => gap.quotes?.some((quote) => quoted.has(`${quote.source || ""}\n${quote.text || ""}`)))
-      .map((gap) => gap.projects || 0),
+  const byGap = (summary?.gaps || [])
+    .filter((gap) => gap.quotes?.some((quote) => quoted.has(`${quote.source || ""}\n${quote.text || ""}`)))
+    .map((gap) => gap.projects || 0);
+  // Gap clusters carry their own project count, but an edit that rewrites or reinforces
+  // an existing instruction quotes instruction-row evidence, which carries none. The fold
+  // hands over the session -> project map behind those rows, so the edit's own quote
+  // sources answer for themselves. A run whose evidence predates the map (or a
+  // project-scoped one, which has no projects) still has the gap count.
+  const sourceProjects = summary?.sourceProjects || {};
+  const byQuoteSource = new Set(
+    edit.evidence.map((item) => sourceProjects[normalizeSourceLabel(item.source)]).filter(Boolean),
   );
+  return Math.max(0, byQuoteSource.size, ...byGap);
 }
 
 export function buildProposal(rawResult, context) {
@@ -512,20 +526,27 @@ export function buildProposal(rawResult, context) {
       }
     }
 
-    // An addition is measured, not declared: text that only goes in is a new instruction.
+    // Corroboration is measured, not declared, and it covers the whole always-loaded
+    // surface: adding, rewriting and removing text all clear the same session floor.
+    // Asking instead whether a rewrite "really" adds an instruction requires a semantic
+    // text classifier. Counting the distinct sessions behind an edit's own quotes asks
+    // nothing of the text, so there is no shape to game. Extract and move keep every line
+    // on the always-loaded surface, so they stay exempt; a removal keeps the harm floor
+    // below on top of this one.
     const onlyAdds = hunks.every((h) => h.removed === 0);
+    const changed = onlyAdds ? "adds a new instruction" : `changes ${files[0] ?? memoryFile.path}`;
     const projectGate = scope?.kind === "user" && config.minGapProjects != null;
-    const evidenceProjects = onlyAdds && projectGate ? countedEvidenceProjects(edit, summary) : null;
-    if (!preservesAlwaysLoaded(edit.kind) && onlyAdds && edit.transcripts < config.minGapEvidence) {
+    const evidenceProjects = projectGate ? countedEvidenceProjects(edit, summary) : null;
+    if (!preservesAlwaysLoaded(edit.kind) && edit.transcripts < config.minGapEvidence) {
       violations.push(
-        `edit ${edit.id} ("${edit.title}") adds a new instruction backed by ${edit.transcripts} session(s); ` +
+        `edit ${edit.id} ("${edit.title}") ${changed} backed by ${edit.transcripts} session(s); ` +
           `${config.minGapEvidence} are required`,
       );
       continue;
     }
-    if (!preservesAlwaysLoaded(edit.kind) && onlyAdds && projectGate && evidenceProjects < config.minGapProjects) {
+    if (!preservesAlwaysLoaded(edit.kind) && projectGate && evidenceProjects < config.minGapProjects) {
       violations.push(
-        `edit ${edit.id} ("${edit.title}") adds a new instruction backed by evidence from ${evidenceProjects} project(s); ` +
+        `edit ${edit.id} ("${edit.title}") ${changed} backed by evidence from ${evidenceProjects} project(s); ` +
           `${config.minGapProjects} are required`,
       );
       continue;

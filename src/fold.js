@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { loadConfig } from "./config.js";
 import { classifyInteraction, INTERACTIVE, NON_INTERACTIVE } from "./interaction.js";
 import { findInstructionUnit, instructionUnits, resolveMemoryFiles, similarity } from "./memory.js";
-import { GAP_COVERED_THRESHOLD, GAP_SIMILARITY_THRESHOLD, gapSource } from "./gap-ledger.js";
+import { GAP_COVERED_THRESHOLD, GAP_SIMILARITY_THRESHOLD, gapSource, normalizeSourceLabel } from "./gap-ledger.js";
 import { crossSurfaceDuplicates } from "./overlap.js";
 
 /**
@@ -85,9 +85,14 @@ export function foldEvidence(
   };
 
   const recordObservations = [];
+  // Which project each quote's source label came from. Instruction-row quotes carry no
+  // project of their own, so this is what lets the user-scope project floor count a
+  // rewrite's evidence instead of only a gap cluster's.
+  const sourceProjects = {};
   for (const record of usable) {
     if (record.usedRawTranscript) usedRawCount += 1;
-    const source = gapSource(record.transcript);
+    const source = normalizeSourceLabel(gapSource(record.transcript));
+    if (record.transcript.project) sourceProjects[source] = record.transcript.project;
 
     for (const polarity of ["positive", "negative"]) {
       for (const item of record[polarity] || []) {
@@ -249,6 +254,7 @@ export function foldEvidence(
       crossSurfaceDuplicates: duplicates.length,
     },
     instructions: instructionRows,
+    sourceProjects,
     parentHarmSessions,
     gaps,
     crossSurfaceDuplicates: duplicates,
