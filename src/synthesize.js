@@ -15,6 +15,7 @@ import {
   skillDescriptionTokens,
 } from "./skills.js";
 import { isSuppressedByRejection } from "./state.js";
+import { SURFACE_TARGET } from "./target.js";
 import { emitProgress } from "./progress.js";
 import { measureWorkspace, prepareWorkspace, repoFingerprint, workspacePathFor } from "./workspace.js";
 import { UserError, color, info, warn } from "./logger.js";
@@ -146,6 +147,22 @@ function assertRepoUntouched(repo, before, workspaceRoot) {
   );
 }
 
+function targetRule(target, memoryPath, skillsDir, stagedTargetPath = null) {
+  if (target.kind === "skill") {
+    return (
+      `0. **This run targets \`./${stagedTargetPath || workspacePathFor(target.path)}\` only.** It is the one staged file. ` +
+      `Do not edit \`./${memoryPath}\` or any other skill, and do not create a skill; extraction does not apply.\n`
+    );
+  }
+  if (target.kind === "memory") {
+    return (
+      `0. **This run targets \`./${memoryPath}\` only.** The skills listed above live in the repository and are ` +
+      `read-only: do not edit them. You may still extract a NEW skill under \`./${skillsDir}/\`.\n`
+    );
+  }
+  return "";
+}
+
 /**
  * Everything the edit and annotation turns need: prompt values, the `buildProposal`
  * context, and the overflow target.
@@ -161,8 +178,11 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scop
   for (const w of overflow.warnings) warn(w);
   const skillDirs = resolveProjectSkillDirs(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
   const skillFiles = loadProjectSkills(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
+  // The budget is the whole always-loaded surface whatever the target: a skill target
+  // moves it by that skill's description-line delta, nothing else changes.
   const descriptionTokens = skillDescriptionTokens(skillFiles);
   const maxEdits = effectiveMaxEdits(memoryFile, config, descriptionTokens);
+  const target = config.target || SURFACE_TARGET;
 
   const common = {
     MEMORY_PATH: workspacePathFor(memoryFile.path),
@@ -181,6 +201,7 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scop
     rejections,
     isSuppressed: isSuppressedByRejection,
     skillFiles,
+    target,
   };
 
   const promptDir = path.join(state.root, "prompts");
@@ -192,6 +213,7 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scop
     overflow,
     skillDirs,
     skillFiles,
+    target,
     descriptionTokens,
     maxEdits,
     common,
@@ -410,6 +432,7 @@ export async function synthesizeProposal({
     overflow,
     skillDirs,
     skillFiles,
+    target,
     descriptionTokens,
     maxEdits,
     common,
@@ -424,17 +447,29 @@ export async function synthesizeProposal({
     scope,
   });
 
-  let workspace = prepareWorkspace({ state, repo, memoryFile, skillsDir: overflow.dir, skillDirs });
+  // Staging holds only the write surface: every skill on a surface run, none of them on
+  // a memory-file target (new extracts are still measured), just the one on a skill target.
+  const stagedSkills = target.kind === "surface" ? null : target.kind === "skill" ? [target.path] : [];
+  const workspaceOptions = { state, repo, memoryFile, skillsDir: overflow.dir, skillDirs, stagedSkills };
+  let workspace = prepareWorkspace(workspaceOptions);
   const stagedSkillsDir =
     workspace.skillMappings.find((mapping) => mapping.logical === overflow.dir)?.staged ||
     workspacePathFor(overflow.dir);
+  // Unstaged skills keep their repository paths in the index: the model may read them
+  // there for grounding, and the target rule says they are not writable.
   const stagedSkillFiles = skillFiles.map((skill) => ({
     ...skill,
-    path: workspace.stagedPaths.get(skill.path) || workspacePathFor(skill.path),
+    path: workspace.stagedPaths.get(skill.path) || skill.path,
   }));
 
   const editValues = {
     ...common,
+    TARGET_RULE: targetRule(
+      target,
+      workspace.memoryWorkspacePath,
+      stagedSkillsDir,
+      target.kind === "skill" ? workspace.stagedPaths.get(target.path) || workspacePathFor(target.path) : null,
+    ),
     REPO_NAME: repo.name,
     REPO_ROOT: repo.root,
     TRANSCRIPT_COUNT: String(summary.analyzedSessions),
@@ -508,7 +543,7 @@ export async function synthesizeProposal({
     holder.ranWith = current.agent;
     chosen = current;
     if (current !== pick) notes.push(`synthesis fell through to ${current.agent} (${current.model})`);
-    workspace = prepareWorkspace({ state, repo, memoryFile, skillsDir: overflow.dir, skillDirs });
+    workspace = prepareWorkspace(workspaceOptions);
     progress("edit", { attempt: 1 });
     holder.session = await openSession({
       agent: current.agent,

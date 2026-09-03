@@ -415,16 +415,36 @@ test("user synthesis can propose against relocated external memory", async () =>
   assert.equal(proposal.edits.length, 0);
 });
 
-test("relocated skill prompts use their actual staged paths", async () => {
+test("a skill target in a relative external directory is staged and uses its actual staged path", async () => {
   const setupResult = setup(
     { edit: {}, annotations: [{ reply: { edits: [] } }] },
     { scope: { kind: "user" }, externalSkills: true },
   );
-  await setupResult.run();
+  const relativeSkillsDir = path.relative(setupResult.repo.root, setupResult.externalSkillsDir);
+  setupResult.config.skillsDir = relativeSkillsDir;
+  setupResult.config.skillsDirs = [relativeSkillsDir];
+  setupResult.config.target = {
+    kind: "skill",
+    path: path.join(setupResult.externalSkillsDir, "db/SKILL.md"),
+    name: "db",
+  };
+  const stagedPath = `${workspacePathFor(setupResult.externalSkillsDir)}/db/SKILL.md`;
+  fs.writeFileSync(
+    process.env.FAKE_ACPX_SCRIPT,
+    JSON.stringify({
+      edit: { [stagedPath]: { replace: [["Load for database work.", "Load before database work or SQL changes."]] } },
+      annotations: [{ reply: { edits: [tighten(["H1"])] } }],
+    }),
+  );
+
+  const { proposal, violations } = await setupResult.run();
+  assert.deepEqual(violations, []);
+  assert.deepEqual(
+    proposal.edits.map((edit) => edit.file),
+    [path.join(setupResult.externalSkillsDir, "db/SKILL.md")],
+  );
   const prompt = fs.readFileSync(path.join(setupResult.config.state.root, "prompts/synthesis-edit.md"), "utf8");
-  const stagedDir = workspacePathFor(setupResult.externalSkillsDir);
-  assert.ok(prompt.includes(stagedDir));
-  assert.ok(prompt.includes(`${stagedDir}/db/SKILL.md`));
+  assert.ok(prompt.includes(`This run targets \`./${stagedPath}\` only`));
 });
 
 test("an agent that changes nothing yields an empty proposal, never an invented edit", async () => {
@@ -542,4 +562,91 @@ test("an oversized non-compliance blob synthesizes as a list-item restructure, n
   assert.match(editPrompt, /### Oversized units that failed to steer/);
   assert.match(editPrompt, /Preferred reinforcement is a restructure-in-place/);
   assert.match(editPrompt, /bold label on the blob is not a strengthen/);
+});
+
+const DB_SKILL = "---\nname: db\ndescription: Load for database work.\n---\n\n- Keep transactions short.\n";
+
+test("a memory-file target never stages existing skills, and the run proposes only against the memory file", async () => {
+  const { repo, config, run } = setup({
+    edit: { "AGENTS.md": { replace: [["- Keep this file short.\n", "- Keep this file short; point at files.\n"]] } },
+    annotations: [{ reply: { edits: [tighten(["H1"])] } }],
+  });
+  fs.mkdirSync(path.join(repo.root, ".agents/skills/db"), { recursive: true });
+  fs.writeFileSync(path.join(repo.root, ".agents/skills/db/SKILL.md"), DB_SKILL);
+  config.target = { kind: "memory", path: "AGENTS.md" };
+  const { proposal, violations } = await run();
+  assert.deepEqual(violations, []);
+  assert.deepEqual(proposal.target, { kind: "memory", path: "AGENTS.md" });
+  assert.deepEqual(
+    proposal.edits.map((e) => e.file),
+    ["AGENTS.md"],
+  );
+  assert.equal(fs.existsSync(path.join(config.state.root, "synthesis", ".agents/skills/db/SKILL.md")), false);
+  const prompt = fs.readFileSync(path.join(config.state.root, "prompts/synthesis-edit.md"), "utf8");
+  assert.match(prompt, /This run targets `\.\/AGENTS\.md` only/);
+});
+
+test("a skill target in an absolute in-repo skills directory is staged under its repo-relative path", async () => {
+  const targeted = setup({
+    edit: {
+      "custom-skills/db/SKILL.md": {
+        replace: [["Load for database work.", "Load before database work or SQL changes."]],
+      },
+    },
+    annotations: [{ reply: { edits: [tighten(["H1"])] } }],
+  });
+  const skillsDir = path.join(targeted.repo.root, "custom-skills");
+  fs.mkdirSync(path.join(skillsDir, "db"), { recursive: true });
+  fs.writeFileSync(path.join(skillsDir, "db/SKILL.md"), DB_SKILL);
+  fs.mkdirSync(path.join(skillsDir, "review"), { recursive: true });
+  fs.writeFileSync(
+    path.join(skillsDir, "review/SKILL.md"),
+    "---\nname: review\ndescription: Load for pull request review.\n---\n\n- Check the tests.\n",
+  );
+  targeted.config.skillsDir = skillsDir;
+  targeted.config.skillsDirs = [skillsDir];
+  targeted.config.target = { kind: "skill", path: "custom-skills/db/SKILL.md", name: "db" };
+
+  const { proposal, violations } = await targeted.run();
+  assert.deepEqual(violations, []);
+  assert.deepEqual(
+    proposal.edits.map((edit) => edit.file),
+    ["custom-skills/db/SKILL.md"],
+  );
+  const prompt = fs.readFileSync(path.join(targeted.config.state.root, "prompts/synthesis-edit.md"), "utf8");
+  assert.match(prompt, /review \(custom-skills\/review\/SKILL\.md;.*Load for pull request review\./);
+  assert.equal(fs.existsSync(path.join(targeted.config.state.root, "synthesis/custom-skills/review/SKILL.md")), false);
+});
+
+test("a skill target stages that skill alone; a staged write to AGENTS.md is refused, a direct one is caught by the fingerprint", async () => {
+  const target = { kind: "skill", path: ".agents/skills/db/SKILL.md", name: "db" };
+  const hijack = setup({
+    edit: {
+      ".agents/skills/db/SKILL.md": { replace: [["Keep transactions short.", "Keep every transaction short."]] },
+      "AGENTS.md": "# hijack\n",
+    },
+    annotations: [{ reply: { edits: [tighten(["H1", "H2"])] } }],
+  });
+  fs.mkdirSync(path.join(hijack.repo.root, ".agents/skills/db"), { recursive: true });
+  fs.writeFileSync(path.join(hijack.repo.root, ".agents/skills/db/SKILL.md"), DB_SKILL);
+  hijack.config.target = target;
+  await assert.rejects(hijack.run(), (err) => {
+    assert.ok(err instanceof ProposalViolation);
+    assert.match(err.violations.join("\n"), /targets \.agents\/skills\/db\/SKILL\.md only; AGENTS\.md is out of scope/);
+    return true;
+  });
+  assert.equal(fs.readFileSync(path.join(hijack.repo.root, "AGENTS.md"), "utf8"), AGENTS);
+  assert.equal(hijack.config.state.readProposal()?.edits.length, 0);
+  const direct = setup({ edit: {} });
+  fs.mkdirSync(path.join(direct.repo.root, ".agents/skills/db"), { recursive: true });
+  fs.writeFileSync(path.join(direct.repo.root, ".agents/skills/db/SKILL.md"), DB_SKILL);
+  direct.config.target = target;
+  fs.writeFileSync(
+    process.env.FAKE_ACPX_SCRIPT,
+    JSON.stringify({
+      edit: { [path.join(direct.repo.root, "AGENTS.md")]: { replace: [[TWO_ITEMS, ""]] } },
+      annotations: [{ reply: { edits: [] } }],
+    }),
+  );
+  await assert.rejects(direct.run(), /synthesis changed AGENTS\.md in the repository directly/);
 });
