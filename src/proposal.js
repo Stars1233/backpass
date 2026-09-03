@@ -373,6 +373,7 @@ export function buildProposal(rawResult, context) {
   }
 
   const accepted = [];
+  const suppressed = [];
   for (const edit of edits) {
     const changes = edit.changeIds.map((id) => changesById.get(id)).filter(Boolean);
     const created = changes.filter((c) => c.kind === "created");
@@ -632,6 +633,7 @@ export function buildProposal(rawResult, context) {
 
     if (isSuppressed(proposed, rejections)) {
       // Rejections are respected until materially new evidence arrives (captain tweak 3).
+      suppressed.push(proposed);
       continue;
     }
     accepted.push(proposed);
@@ -731,6 +733,11 @@ export function buildProposal(rawResult, context) {
     .filter((file) => measured.originals?.has(file))
     .map((file) => ({ file, hash: memoryTextHash(measured.originals.get(file)) }));
 
+  // Instructions the evidence named as candidates that no accepted edit names.
+  // Counted here, not in the fold, because it depends on the accepted edit list.
+  // Display only; nothing downstream reads it.
+  const funnelOutcome = funnelInstructionOutcome(summary, accepted, suppressed);
+
   const proposal = {
     version: 2,
     tool: "backpass",
@@ -764,7 +771,14 @@ export function buildProposal(rawResult, context) {
       gapSightings: summary?.totals?.gapSightings ?? null,
       orchestrationGapSightings: summary?.totals?.orchestrationGapSightings ?? null,
       reportOnlyGapClusters: summary?.totals?.reportOnlyGapClusters ?? null,
+      reportOnlyByReason: summary?.totals?.reportOnlyByReason ?? null,
       droppedGapSingletons: summary?.totals?.droppedGapSingletons ?? null,
+      // The existing-instruction lane of the apply surface's funnel: how many
+      // instructions the negatives land on, and how many no accepted edit names.
+      instructionsWithNegatives: summary?.totals?.instructionsWithNegatives ?? null,
+      instructionsLeftAlone: funnelOutcome?.instructionsLeftAlone ?? null,
+      leftAloneMaxSessions: funnelOutcome?.leftAloneMaxSessions ?? null,
+      instructionsSuppressed: funnelOutcome?.suppressed ?? null,
       skillExtractions: accepted.reduce((n, e) => {
         if (e.kind !== "extract") return n;
         const createdSkills = editSkills(e).length;
@@ -778,6 +792,33 @@ export function buildProposal(rawResult, context) {
   };
 
   return { proposal, violations };
+}
+
+// Display counter for the apply surface's funnel: the instructions that drew a negative
+// finding and that no accepted edit names. A summary from before the funnel counters
+// existed yields null, never an invented zero.
+function funnelInstructionOutcome(summary, accepted, suppressed) {
+  if (
+    !Array.isArray(summary?.instructions) ||
+    typeof summary?.totals?.instructionsWithNegatives !== "number" ||
+    !summary?.totals?.reportOnlyByReason ||
+    typeof summary.totals.reportOnlyByReason !== "object"
+  )
+    return null;
+  const candidates = summary.instructions.filter((row) => row.negative > 0);
+  const candidateIds = new Set(candidates.map((row) => row.instruction));
+  const acceptedIds = new Set(accepted.flatMap((edit) => edit.instructions || []).filter((id) => candidateIds.has(id)));
+  const suppressedIds = new Set(
+    suppressed.flatMap((edit) => edit.instructions || []).filter((id) => candidateIds.has(id) && !acceptedIds.has(id)),
+  );
+  const untouched = candidates.filter(
+    (row) => !acceptedIds.has(row.instruction) && !suppressedIds.has(row.instruction),
+  );
+  return {
+    instructionsLeftAlone: untouched.length,
+    leftAloneMaxSessions: untouched.reduce((n, row) => Math.max(n, row.nonComplianceSessions ?? row.sessions ?? 0), 0),
+    suppressed: suppressedIds.size,
+  };
 }
 
 export function slug(text) {
