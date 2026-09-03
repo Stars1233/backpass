@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { UserError } from "./logger.js";
 import { estimateTokens } from "./tokens.js";
 
 /**
@@ -264,35 +265,71 @@ export const CANONICAL_SKILLS_DIR = ".agents/skills";
 export const CLAUDE_SKILLS_LINK = ".claude/skills";
 export const CLAUDE_SKILLS_LINK_TARGET = path.posix.join("..", CANONICAL_SKILLS_DIR);
 
+export function normalizeSkillsDir(skillsDir) {
+  if (typeof skillsDir !== "string" || !skillsDir.trim()) {
+    throw new UserError("config.skillsDir must be a non-empty path string");
+  }
+  const normalized = skillsDir.replaceAll("\\", "/");
+  const withoutTrailingSlashes = normalized.replace(/\/+$/, "");
+  const volumeRoot = /^([A-Za-z]:)\/+$/u.exec(normalized);
+  const result = volumeRoot ? `${volumeRoot[1]}/` : withoutTrailingSlashes;
+  if (!result) throw new UserError("config.skillsDir must be a non-empty path string");
+  return result;
+}
+
 /**
  * Pick the directory skill extractions target.
  *
  * Skills only pay off if the harness loads them, so the answer is the canonical
  * `.agents/skills` (mirrored to `.claude/skills` by symlink) unless the user explicitly
- * configured another directory that already exists. The bare `skills/` dir is an
- * installer/public convention that no harness auto-loads, so it is never auto-detected -
- * it is only honored when named in the config. Resolution is read-only; the layout is
- * created at write time (`ensureSkillsLayout`), which keeps every pre-apply stage
+ * configured an existing harness-loaded directory, including `.claude/skills`. The bare
+ * `skills/` dir is an installer/public convention that no harness auto-loads, so it is
+ * never auto-detected - it is only honored when named in the config. Resolution is
+ * read-only; the layout is created at write time (`ensureSkillsLayout`), which keeps every pre-apply stage
  * side-effect free.
  */
 export function resolveOverflowTarget(
   repoRoot,
   skillsDir = CANONICAL_SKILLS_DIR,
-  { claudeSkillsDir = CLAUDE_SKILLS_LINK } = {},
+  { claudeSkillsDir = CLAUDE_SKILLS_LINK, allowExternal = false } = {},
 ) {
+  const configuredDir = normalizeSkillsDir(skillsDir);
   const warnings = [];
   const canonical = path.join(repoRoot, CANONICAL_SKILLS_DIR);
   const claudeLink = path.isAbsolute(claudeSkillsDir) ? claudeSkillsDir : path.join(repoRoot, claudeSkillsDir);
   const target = path.relative(path.dirname(claudeLink), canonical) || ".";
   const claude = inspectClaudeSkillsLink(repoRoot, claudeSkillsDir);
-  if (claude.state === "dir") warnings.push(claudeSkillsDirWarning(claudeSkillsDir, target));
+  const explicit = configuredDir && configuredDir !== CANONICAL_SKILLS_DIR;
+  const resolvedSkillsDir = path.isAbsolute(configuredDir) ? configuredDir : path.join(repoRoot, configuredDir);
+  if (explicit && !allowExternal) assertSkillsDirInsideRepo(repoRoot, configuredDir, resolvedSkillsDir);
+  const dir = explicit && fs.existsSync(resolvedSkillsDir) ? configuredDir : CANONICAL_SKILLS_DIR;
+  if (claude.state === "dir" && dir === CANONICAL_SKILLS_DIR)
+    warnings.push(claudeSkillsDirWarning(claudeSkillsDir, target));
+  return { kind: "skills", dir, warnings };
+}
 
-  const explicit = skillsDir && skillsDir !== CANONICAL_SKILLS_DIR && skillsDir !== CLAUDE_SKILLS_LINK;
-  const resolvedSkillsDir = path.isAbsolute(skillsDir) ? skillsDir : path.join(repoRoot, skillsDir);
-  if (explicit && fs.existsSync(resolvedSkillsDir)) {
-    return { kind: "skills", dir: skillsDir, warnings };
+function assertSkillsDirInsideRepo(repoRoot, configuredDir, resolvedSkillsDir) {
+  const root = path.resolve(repoRoot);
+  if (!isPathInside(root, path.resolve(resolvedSkillsDir))) throw invalidSkillsDir(configuredDir);
+  if (!fs.existsSync(resolvedSkillsDir)) return;
+
+  try {
+    if (!isPathInside(fs.realpathSync(root), fs.realpathSync(resolvedSkillsDir))) throw invalidSkillsDir(configuredDir);
+  } catch (err) {
+    if (err instanceof UserError) throw err;
   }
-  return { kind: "skills", dir: CANONICAL_SKILLS_DIR, warnings };
+}
+
+function isPathInside(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function invalidSkillsDir(configuredDir) {
+  return new UserError(
+    `config.skillsDir "${configuredDir}" must resolve inside the repository`,
+    "use a skills directory inside the project, such as .claude/skills",
+  );
 }
 
 function claudeSkillsDirWarning(claudeSkillsDir = CLAUDE_SKILLS_LINK, target = CLAUDE_SKILLS_LINK_TARGET) {
