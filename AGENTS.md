@@ -281,6 +281,12 @@ list` only sees this clone. `attachSiblingClones` in `src/repo.js` also searches
   Grok overlays ride acpx `--agent`; that hatch has no `-s` of its own (acpx 0.13.x:
   `unknown option '-s'`), so `openSession`'s `prompt()` sends the `prompt` subcommand
   before `-s` when `acpxAgentCommand` is set. Built-in agents keep the implicit form.
+- **Only acpx session creation gets the adapter cold-start budget.** Built-in adapters may
+  launch through a package-exec bridge, so `sessions new` uses
+  `SESSION_CREATE_TIMEOUT_MS`; probe status/close retain `PROBE_TIMEOUT_MS` (including its
+  per-agent override), and open sessions keep their shorter post-create limits. Handle
+  `result.timedOut` before generic non-zero exits so a stalled create is never reported as
+  missing session support. `test/acpx-session-create-timeout.test.js` covers both contracts.
 - **Model and effort overrides are invocation-scoped.** Never ACP `set model` / Pi
   `set thought_level` (those rewrite `~/.pi/agent/settings.json`) and never edit-then-restore
   harness defaults. `src/harness-invoke.js` owns the harness overlay mechanisms and
